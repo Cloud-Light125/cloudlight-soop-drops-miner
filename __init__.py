@@ -1,0 +1,1 @@
+"""SOOP Live Drops Miner."""
