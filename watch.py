@@ -7,7 +7,14 @@ from typing import Any
 
 import aiohttp
 
-from .constants import GATHER_URL, PLAY_ORIGIN, SEP, USER_AGENT
+from .constants import (
+    GATHER_URL,
+    HTTP_CONNECT_TIMEOUT,
+    HTTP_TOTAL_TIMEOUT,
+    PLAY_ORIGIN,
+    SEP,
+    USER_AGENT,
+)
 from .models import LiveChannel
 
 
@@ -187,7 +194,11 @@ class WatchHeartbeat:
             "Referer": referer,
             "Accept": "*/*",
         }
-        async with session.post(GATHER_URL, data=payload, headers=headers) as resp:
+        timeout = aiohttp.ClientTimeout(
+            total=HTTP_TOTAL_TIMEOUT,
+            connect=HTTP_CONNECT_TIMEOUT,
+        )
+        async with session.post(GATHER_URL, data=payload, headers=headers, timeout=timeout) as resp:
             if resp.status != 200:
                 return False
             text = await resp.text()

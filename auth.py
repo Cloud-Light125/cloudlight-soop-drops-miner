@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+from pathlib import Path
 from typing import Any
 
 import aiohttp
 from yarl import URL
 
-from .constants import COOKIES_PATH, LOGIN_URL, USER_AGENT
+from .constants import ACCOUNTS_DIR, COOKIES_PATH, LOGIN_URL, USER_AGENT
 
 COOKIE_NAMES = (
     "AbroadChk",
@@ -24,17 +26,84 @@ COOKIE_NAMES = (
 )
 
 
-def save_cookies(cookies: dict[str, str]) -> None:
-    COOKIES_PATH.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
+def cookies_path_for(userid: str) -> Path:
+    return ACCOUNTS_DIR / userid / "cookies.json"
 
 
-def load_cookies() -> dict[str, str] | None:
+def migrate_legacy_cookies() -> str | None:
+    """将旧版 cookies.json 迁移到 accounts/<userid>/。"""
     if not COOKIES_PATH.is_file():
         return None
-    data = json.loads(COOKIES_PATH.read_text(encoding="utf-8"))
-    if isinstance(data, dict) and data:
-        return {str(k): str(v) for k, v in data.items()}
+    try:
+        data = json.loads(COOKIES_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict) or not data:
+        return None
+    cookies = {str(k): str(v) for k, v in data.items()}
+    uid = userid_from_cookies(cookies)
+    dest = cookies_path_for(uid)
+    if not dest.is_file():
+        save_cookies(cookies, uid)
+    return uid
+
+
+def save_cookies(cookies: dict[str, str], userid: str | None = None) -> str:
+    uid = userid or userid_from_cookies(cookies)
+    path = cookies_path_for(uid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
+    return uid
+
+
+def load_cookies(userid: str | None = None) -> dict[str, str] | None:
+    migrate_legacy_cookies()
+    if userid:
+        path = cookies_path_for(userid)
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data:
+            return {str(k): str(v) for k, v in data.items()}
+        return None
+
+    accounts = list_accounts()
+    if accounts:
+        return load_cookies(accounts[0])
+    if COOKIES_PATH.is_file():
+        data = json.loads(COOKIES_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data:
+            return {str(k): str(v) for k, v in data.items()}
     return None
+
+
+def load_all_cookies() -> dict[str, dict[str, str]]:
+    migrate_legacy_cookies()
+    result: dict[str, dict[str, str]] = {}
+    for uid in list_accounts():
+        cookies = load_cookies(uid)
+        if cookies:
+            result[uid] = cookies
+    return result
+
+
+def list_accounts() -> list[str]:
+    migrate_legacy_cookies()
+    if not ACCOUNTS_DIR.is_dir():
+        return []
+    return sorted(
+        p.name
+        for p in ACCOUNTS_DIR.iterdir()
+        if p.is_dir() and cookies_path_for(p.name).is_file()
+    )
+
+
+def remove_account(userid: str) -> bool:
+    path = ACCOUNTS_DIR / userid
+    if not path.is_dir():
+        return False
+    shutil.rmtree(path)
+    return True
 
 
 def cookie_header(cookies: dict[str, str]) -> str:
@@ -58,7 +127,6 @@ async def login(userid: str, password: str) -> dict[str, str]:
             if '"RESULT":1' not in body and '"RESULT": 1' not in body:
                 raise RuntimeError(f"登录被拒绝: {body[:200]}")
 
-            # 多个 Set-Cookie 时 headers.get 只能拿到第一个，需从 resp.cookies 读取
             cookies: dict[str, str] = {name: morsel.value for name, morsel in resp.cookies.items()}
             if not cookies.get("AuthTicket") and not cookies.get("BbsTicket"):
                 for cookie in session.cookie_jar:
@@ -68,7 +136,7 @@ async def login(userid: str, password: str) -> dict[str, str]:
     if "AuthTicket" not in cookies and "BbsTicket" not in cookies:
         raise RuntimeError("登录未返回有效 Ticket Cookie")
 
-    save_cookies(cookies)
+    save_cookies(cookies, userid)
     return cookies
 
 

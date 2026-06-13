@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, Callable
 
 import aiohttp
 
-from .constants import DROPS_API, DROPS_ORIGIN, USER_AGENT
-from .models import InventoryItem, Mission
+from .constants import DROPS_API, DROPS_EVENT_URL, DROPS_MISSION_URL, DROPS_ORIGIN, USER_AGENT
+from .models import DropEvent, InventoryItem, Mission
+
+logger = logging.getLogger("SoopDropsMiner")
 
 
 class DropsClient:
@@ -33,6 +36,101 @@ class DropsClient:
                 msg = data.get("message", "未登录") if isinstance(data, dict) else "未登录"
                 raise RuntimeError(f"Drops API 认证失败: {msg}")
             return data
+
+    async def get_drops_enabled(self) -> bool | None:
+        """读取账号 Drops 总开关（对应官网 mission 页顶部开关）。"""
+        data = await self._request("POST", "get_drops_enable.php", json_body={"enable": None})
+        value = data.get("data")
+        if value is None:
+            return None
+        return value == 1 or value is True
+
+    async def set_drops_enabled(self, enabled: bool) -> bool:
+        data = await self._request(
+            "POST",
+            "get_drops_enable.php",
+            json_body={"enable": 1 if enabled else 0},
+        )
+        return data.get("data") == 1
+
+    async def ensure_drops_ready(
+        self,
+        *,
+        on_info: Callable[[str], None] | None = None,
+    ) -> None:
+        """自动开启 Drops 开关并预热 mission 会话（替代用户手动打开官网开关）。"""
+        enabled = await self.get_drops_enabled()
+        if enabled is False:
+            msg = "Drops 开关未开启，正在自动开启…"
+            if on_info:
+                on_info(msg)
+            else:
+                logger.info(msg)
+            await self.set_drops_enabled(True)
+
+        assert self._session is not None
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/json",
+            "Referer": DROPS_ORIGIN,
+        }
+        async with self._session.get(DROPS_MISSION_URL, headers=headers) as resp:
+            await resp.read()
+        async with self._session.get(DROPS_EVENT_URL, headers=headers) as resp:
+            await resp.read()
+
+    @staticmethod
+    def empty_missions_hint(uid: str, *, progress_count: int | None = None) -> str:
+        event_part = (
+            f"官网活动页当前有 {progress_count} 个进行中的活动。"
+            if progress_count
+            else "可打开「活动页」查看当前全部 Drops 活动。"
+        )
+        return (
+            f"账号 {uid} mission 页暂无任务（已自动开启 Drops 开关）。"
+            "mission 仅显示「已参与」的活动：进入带 Drops 的直播间后会自动加入，"
+            "观看一段时间后任务才会出现在 mission 页。"
+            f"{event_part}"
+            "若长期仍无任务，常见原因：活动 dupFlag 限制每人仅一次、需绑定游戏账号、"
+            "或该账号不符合活动条件。"
+        )
+
+    @staticmethod
+    def progress_events_summary(events: list[DropEvent], *, limit: int = 5) -> str:
+        if not events:
+            return "活动页当前无进行中的 Drops 活动。"
+        lines = [f"活动页进行中 {len(events)} 个（mission 需进房观看后才会出现对应任务）："]
+        for ev in events[:limit]:
+            dup = " · 限一次" if ev.dup_flag else ""
+            lines.append(f"  · {ev.title}{dup}")
+        if len(events) > limit:
+            lines.append(f"  … 另有 {len(events) - limit} 个，见 {DROPS_EVENT_URL}")
+        return "\n".join(lines)
+
+    async def get_events(
+        self,
+        *,
+        filter: str = "progress",
+        game_idx: str = "all",
+        page_no: int = 1,
+        page_size: int = 50,
+    ) -> list[DropEvent]:
+        data = await self._request(
+            "POST",
+            "get_drops_event_list.php",
+            json_body={
+                "pageNo": page_no,
+                "prePageNo": page_size,
+                "filter": filter,
+                "gameIdx": game_idx,
+            },
+            referer=DROPS_EVENT_URL,
+        )
+        rows = data.get("data") or []
+        return [DropEvent.from_api(row) for row in rows if isinstance(row, dict)]
+
+    async def get_progress_events(self) -> list[DropEvent]:
+        return await self.get_events(filter="progress")
 
     async def get_missions(self) -> list[Mission]:
         data = await self._request("GET", "get_drops_mission_list.php")

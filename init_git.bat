@@ -10,7 +10,13 @@ if errorlevel 1 (
 )
 
 if exist "cookies.json" (
-    echo [提示] 已忽略 cookies.json，不会纳入版本库
+    echo [提示] cookies.json 已在 .gitignore 中，不会纳入版本库
+)
+if exist "accounts\" (
+    echo [提示] accounts/ 已在 .gitignore 中，不会纳入版本库
+)
+if exist "..\soop_tools\" (
+    echo [提示] 上级 soop_tools/ 为本地开发辅助脚本，请勿加入本仓库
 )
 
 if not exist ".git" (
@@ -22,6 +28,13 @@ if not exist ".git" (
 
 echo [2/4] 暂存文件...
 git add -A
+git diff --cached --name-only | findstr /i /r "cookies accounts soop_tools \.har _probe soop_capture" >nul 2>&1
+if not errorlevel 1 (
+    echo [错误] 暂存区含 cookies、accounts、soop_tools 或抓包文件，已中止提交
+    echo 请检查 .gitignore 后执行: git reset HEAD
+    git diff --cached --name-only
+    exit /b 1
+)
 git status --short
 
 echo.

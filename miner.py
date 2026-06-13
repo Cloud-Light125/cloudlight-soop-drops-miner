@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -10,12 +11,44 @@ import aiohttp
 
 from .auth import apply_cookies, load_cookies, login, userid_from_cookies
 from .center import BridgeSession
-from .constants import HEARTBEAT_INTERVAL, INVENTORY_POLL_INTERVAL, MISSION_POLL_INTERVAL
+from .constants import (
+    HEARTBEAT_INTERVAL,
+    HTTP_CONNECT_TIMEOUT,
+    HTTP_TOTAL_TIMEOUT,
+    INVENTORY_POLL_INTERVAL,
+    MISSION_POLL_INTERVAL,
+    NETWORK_RECOVER_COOLDOWN,
+)
 from .drops import DropsClient
+from .channel import (
+    ChannelConfig,
+    ONE_STREAM_NOTICE,
+    PRIORITY_MISSION_AUTO,
+    active_progress_missions,
+    channel_matches_mission_category,
+    collect_mission_channels,
+    ended_fixed_missions,
+    filter_missions_by_priority,
+    format_channel_preview,
+    has_active_fixed_missions,
+    has_active_lottery_missions,
+    is_category_fixed_mission,
+    manual_channel_mismatch_warnings,
+    mission_progresses_on_channel,
+    mission_pick_label,
+    missions_for_channel,
+    pick_channel,
+)
 from .models import InventoryItem, LiveChannel, Mission
 from .watch import WatchHeartbeat
 
 logger = logging.getLogger("SoopDropsMiner")
+
+
+class _AccountLogAdapter(logging.LoggerAdapter):
+    def process(self, msg: str, kwargs: dict) -> tuple[str, dict]:
+        return f"[{self.extra['uid']}] {msg}", kwargs
+
 
 StateCallback = Callable[["MinerState"], None]
 
@@ -31,13 +64,22 @@ class MinerState:
     bridge_connected: bool = False
     missions: list[Mission] = field(default_factory=list)
     inventory: list[InventoryItem] = field(default_factory=list)
+    available_channels: list[LiveChannel] = field(default_factory=list)
 
 
 class SoopMiner:
-    def __init__(self, cookies: dict[str, str], *, on_state: StateCallback | None = None):
+    def __init__(
+        self,
+        cookies: dict[str, str],
+        *,
+        on_state: StateCallback | None = None,
+        channel_config: ChannelConfig | None = None,
+    ):
         self.cookies = cookies
         self.uid = userid_from_cookies(cookies)
+        self._log = _AccountLogAdapter(logger, {"uid": self.uid})
         self._on_state = on_state
+        self._channel_config = channel_config or ChannelConfig()
         self._session: aiohttp.ClientSession | None = None
         self._drops: DropsClient | None = None
         self._heartbeat: WatchHeartbeat | None = None
@@ -45,22 +87,118 @@ class SoopMiner:
         self._current: LiveChannel | None = None
         self._missions: list[Mission] = []
         self._inventory: list[InventoryItem] = []
-        self._stall_polls = 0
-        self._last_view_time: int | None = None
+        self._stall_polls: dict[str, int] = {}
+        self._last_view_times: dict[str, int] = {}
         self._stop = asyncio.Event()
         self._running = False
+        self._ended_logged: set[str] = set()
+        self._empty_missions_logged = False
+        self._had_missions = False
+        self._last_network_recover = 0.0
+        self._heartbeat_fail_streak = 0
+
+    @staticmethod
+    def _is_session_closed_error(exc: BaseException) -> bool:
+        return isinstance(exc, RuntimeError) and "session is closed" in str(exc).lower()
+
+    def _new_http_session(self) -> aiohttp.ClientSession:
+        timeout = aiohttp.ClientTimeout(
+            total=HTTP_TOTAL_TIMEOUT,
+            connect=HTTP_CONNECT_TIMEOUT,
+        )
+        session = aiohttp.ClientSession(timeout=timeout)
+        apply_cookies(session, self.cookies)
+        return session
+
+    async def _ensure_session(self) -> None:
+        if self._session is not None and not self._session.closed:
+            return
+        if self._session is not None:
+            await self._session.close()
+        self._session = self._new_http_session()
+        self._drops = DropsClient(self._session)
+
+    async def _recover_network(self, reason: str) -> None:
+        now = time.monotonic()
+        if now - self._last_network_recover < NETWORK_RECOVER_COOLDOWN:
+            return
+        self._last_network_recover = now
+        self._log.warning("网络异常，正在恢复会话 (%s)…", reason)
+        if self._bridge:
+            try:
+                await self._bridge.close()
+            except Exception:
+                pass
+            self._bridge = None
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
+        await self._ensure_session()
+        self._heartbeat_fail_streak = 0
+        self._log.info("HTTP 会话已恢复")
+        self._emit_state("重连中")
+
+    def _log_stall(self, mission: Mission, item) -> None:
+        bridge_ok = self._bridge is not None and self._bridge.is_connected
+        ch = self._current
+        ch_info = f"{ch.user_nick}({ch.user_id})" if ch else "无"
+        cate_hint = ""
+        if mission.is_lottery and ch:
+            ok = channel_matches_mission_category(mission, ch)
+            need = mission.category_name or mission.category_no or "?"
+            cate_hint = f" 分类匹配={'是' if ok else f'否(需要 {need})'}"
+        self._log.warning(
+            "进度 %d 分钟无变化 (%d/%d) · 直播间 %s · bridge=%s%s",
+            self._stall_polls.get(mission.drops_idx, 0),
+            item.view_time,
+            item.give_term,
+            ch_info,
+            "已连接" if bridge_ok else "未连接",
+            cate_hint,
+        )
+        if mission.is_event_ended or mission.is_truly_ended:
+            self._log.warning("  ↳ 该任务已结束，进度不会再增加")
+        elif mission.is_lottery and ch and not channel_matches_mission_category(mission, ch):
+            self._log.warning("  ↳ 抽奖型需挂「%s」分类的 #드롭스 直播间", mission.category_name or mission.category_no)
+        elif mission.is_fixed and ch and is_category_fixed_mission(mission):
+            if not channel_matches_mission_category(mission, ch):
+                self._log.warning(
+                    "  ↳ 分类固定型需挂「%s」分类的 #드롭스 直播间",
+                    mission.category_name or mission.category_no,
+                )
+
+    def _log_channel_missions(self, channel: LiveChannel) -> None:
+        served = missions_for_channel(self._missions, channel)
+        if served:
+            parts: list[str] = []
+            for m in served:
+                item = m.active_item()
+                if item:
+                    parts.append(f"{m.title[:24]} ({item.view_time}/{item.give_term})")
+            self._log.info("本频道可累计: %s", " · ".join(parts))
+        pending = [
+            m
+            for m in active_progress_missions(self._missions)
+            if not mission_progresses_on_channel(m, channel)
+        ]
+        if pending:
+            hints = [f"{m.category_name or m.title[:16]}" for m in pending]
+            self._log.info(
+                "需换台或调整优先任务才能累计: %s。%s",
+                "、".join(hints),
+                ONE_STREAM_NOTICE,
+            )
 
     async def __aenter__(self) -> SoopMiner:
-        self._session = aiohttp.ClientSession()
-        apply_cookies(self._session, self.cookies)
-        self._drops = DropsClient(self._session)
+        await self._ensure_session()
         return self
 
     async def __aexit__(self, *args: Any) -> None:
         if self._bridge:
             await self._bridge.close()
-        if self._session:
+        if self._session and not self._session.closed:
             await self._session.close()
+        self._session = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -78,6 +216,7 @@ class SoopMiner:
             bridge_connected=self._bridge is not None and self._bridge.is_connected,
             missions=list(self._missions),
             inventory=list(self._inventory),
+            available_channels=collect_mission_channels(self._missions),
         )
 
     def _status_text(self) -> str:
@@ -89,6 +228,12 @@ class SoopMiner:
             return "等待直播间"
         if self._bridge is None:
             return "连接中"
+        if ended_fixed_missions(self._missions) and not has_active_fixed_missions(self._missions):
+            if any(m.is_not_yet_open for m in self._missions if m.is_fixed):
+                return "未开放掉宝"
+            if has_active_lottery_missions(self._missions):
+                return "挂机中·固定型已结束"
+            return "活动已结束"
         return "挂机中"
 
     def _emit_state(self, status: str | None = None) -> None:
@@ -102,33 +247,27 @@ class SoopMiner:
         except Exception:
             pass
 
-    def _pick_channel(self) -> LiveChannel | None:
-        online: list[LiveChannel] = []
-        for mission in self._missions:
-            online.extend(mission.online_channels())
-        if not online:
-            return None
-        if self._current:
-            for ch in online:
-                if ch.user_id == self._current.user_id:
-                    return ch
-        return online[0]
+    async def _resolve_channel(self) -> LiveChannel | None:
+        await self._ensure_session()
+        assert self._session
+        return await pick_channel(self._session, self.cookies, self._missions, self._channel_config)
 
     def _log_progress(self) -> None:
         for mission in self._missions:
             if not mission.items:
                 continue
+            tag = mission.type_label
             active = mission.active_item()
             if active is None:
-                logger.info("[%s] 全部档位已完成", mission.title)
+                self._log.info("[%s] %s 全部档位已完成", tag, mission.title)
                 continue
-            logger.info("[%s] 累计观看 %d 分钟", mission.title, active.view_time)
+            self._log.info("[%s] %s 累计观看 %d 分钟", tag, mission.title, active.view_time)
             active_idx = mission.items.index(active)
             for i, item in enumerate(mission.items):
                 if item.mission_success:
-                    logger.info("  %s %s: 已完成", item.term_label, item.item_name)
+                    self._log.info("  %s %s: 已完成", item.term_label, item.item_name)
                 elif i == active_idx:
-                    logger.info(
+                    self._log.info(
                         "  %s %s: %d/%d 分钟 (%d%%) ← 当前",
                         item.term_label,
                         item.item_name,
@@ -137,7 +276,7 @@ class SoopMiner:
                         item.percent,
                     )
                 else:
-                    logger.info(
+                    self._log.info(
                         "  %s %s: %d/%d 分钟 (%d%%)",
                         item.term_label,
                         item.item_name,
@@ -146,49 +285,109 @@ class SoopMiner:
                         item.percent,
                     )
 
-    async def _refresh_missions(self) -> None:
+    async def _fetch_missions(self) -> None:
+        """拉取 mission 列表并记录进度（不选台）。"""
+        await self._ensure_session()
         assert self._drops
         prev_times: dict[str, int] = {}
+        prev_count = len(self._missions)
         for m in self._missions:
             item = m.active_item()
             if item:
                 prev_times[m.drops_idx] = item.view_time
 
         self._missions = await self._drops.get_missions()
+        new_count = len(self._missions)
+
         if not self._missions:
-            logger.warning("当前没有进行中的 Drops 任务")
-            return
+            if not self._empty_missions_logged:
+                progress_events: list = []
+                try:
+                    progress_events = await self._drops.get_progress_events()
+                except Exception:
+                    pass
+                self._log.warning(
+                    self._drops.empty_missions_hint(
+                        self.uid,
+                        progress_count=len(progress_events) or None,
+                    )
+                )
+                if progress_events:
+                    self._log.info(self._drops.progress_events_summary(progress_events))
+                if self._channel_config.hang_without_missions:
+                    self._log.info("无任务也会先进房；进房观看后 mission 任务会自动出现。")
+                self._empty_missions_logged = True
+        else:
+            if not self._had_missions and new_count > 0:
+                self._log.info("mission 任务已出现：共 %d 个", new_count)
+                self._empty_missions_logged = False
+            self._had_missions = True
 
-        self._log_progress()
-
-        for mission in self._missions:
-            item = mission.active_item()
-            if item and mission.drops_idx in prev_times:
-                delta = item.view_time - prev_times[mission.drops_idx]
-                if delta > 0:
-                    logger.info("  ↳ 观看进度 +%d 分钟", delta)
-                    self._stall_polls = 0
-                    self._last_view_time = item.view_time
-                elif self._last_view_time is not None and item.view_time == self._last_view_time:
-                    self._stall_polls += 1
-                    if self._stall_polls >= 3:
-                        logger.warning(
-                            "进度已 %d 分钟无变化 (%d/%d)，请确认 bridge 进房会话正常",
-                            self._stall_polls,
-                            item.view_time,
-                            item.give_term,
+            for mission in self._missions:
+                if mission.is_event_ended and mission.drops_idx not in self._ended_logged:
+                    if mission.is_not_yet_open:
+                        self._log.warning(
+                            "[%s] %s 当前未开放掉宝（截止 %s）",
+                            mission.type_label,
+                            mission.title,
+                            mission.end_date or "?",
                         )
-            elif item and self._last_view_time is None:
-                self._last_view_time = item.view_time
+                    else:
+                        self._log.warning(
+                            "[%s] %s 活动已结束（截止 %s），继续挂机不会累计该任务进度",
+                            mission.type_label,
+                            mission.title,
+                            mission.end_date or "?",
+                        )
+                    self._ended_logged.add(mission.drops_idx)
 
-        channel = self._pick_channel()
+            self._log_progress()
+
+            trackable = {m.drops_idx for m in active_progress_missions(self._missions)}
+            for drops_idx in list(self._stall_polls):
+                if drops_idx not in trackable:
+                    self._stall_polls.pop(drops_idx, None)
+                    self._last_view_times.pop(drops_idx, None)
+
+            for mission in self._missions:
+                if mission.drops_idx not in trackable:
+                    continue
+                if not mission_progresses_on_channel(mission, self._current):
+                    continue
+                item = mission.active_item()
+                if not item:
+                    continue
+                did = mission.drops_idx
+                if did in self._last_view_times:
+                    delta = item.view_time - self._last_view_times[did]
+                    if delta > 0:
+                        self._log.info("  ↳ [%s] 观看进度 +%d 分钟", mission.title[:30], delta)
+                        self._stall_polls[did] = 0
+                    elif item.view_time == self._last_view_times[did]:
+                        self._stall_polls[did] = self._stall_polls.get(did, 0) + 1
+                        if self._stall_polls[did] >= 3:
+                            self._log_stall(mission, item)
+                self._last_view_times[did] = item.view_time
+
+        if prev_count == 0 and new_count > 0:
+            self._emit_state()
+
+    async def _sync_channel(self) -> None:
+        """按策略选台并更新当前直播间。"""
+        channel = await self._resolve_channel()
         if channel is None:
-            logger.warning("没有在线的 Drops 直播间，等待中...")
+            mode_hint = {
+                "smart": "智能选台",
+                "manual": "手动选台",
+                "owesports": f"仅 {self._channel_config.preferred_bjid}",
+            }.get(self._channel_config.mode, "")
+            if self._current is None:
+                self._log.warning("没有可用的 Drops 直播间（%s），等待中...", mode_hint)
             self._emit_state("等待直播间")
             return
 
         if self._current is None or self._current.user_id != channel.user_id:
-            logger.info("切换到直播间: %s (%s) broadNo=%s", channel.user_nick, channel.user_id, channel.broad_no)
+            self._log.info("切换到直播间: %s (%s) broadNo=%s", channel.user_nick, channel.user_id, channel.broad_no)
             if self._bridge:
                 await self._bridge.close()
                 self._bridge = None
@@ -197,13 +396,29 @@ class SoopMiner:
                 self._heartbeat = WatchHeartbeat(self.uid, channel)
             else:
                 self._heartbeat.switch_channel(channel)
+            self._stall_polls.clear()
+            self._last_view_times.clear()
+            self._log_channel_missions(channel)
+            if self._channel_config.mode == "manual":
+                for msg in manual_channel_mismatch_warnings(channel, self._missions):
+                    self._log.warning(msg)
         elif channel.broad_no and self._current.broad_no != channel.broad_no:
-            logger.info("刷新 broadNo: %s → %s", self._current.broad_no, channel.broad_no)
+            self._log.info("刷新 broadNo: %s → %s", self._current.broad_no, channel.broad_no)
             self._current = channel
             if self._heartbeat:
                 self._heartbeat.switch_channel(channel)
 
         self._emit_state()
+
+    async def _refresh_missions(self, *, channel_first: bool = False) -> None:
+        """刷新任务并同步直播间。启动时 channel_first=True：先进房再拉任务。"""
+        if channel_first and self._channel_config.hang_without_missions:
+            await self._sync_channel()
+            await self._fetch_missions()
+            await self._sync_channel()
+        else:
+            await self._fetch_missions()
+            await self._sync_channel()
 
     async def _ensure_bridge(self) -> None:
         assert self._session and self._current
@@ -213,10 +428,17 @@ class SoopMiner:
         try:
             await bridge.connect(self._session)
         except Exception as exc:
-            logger.error("加入直播间失败: %s", exc)
+            self._log.error("加入直播间失败: %s", exc)
             self._emit_state("进房失败")
             return
         self._bridge = bridge
+        self._log.info(
+            "bridge 已连接 → %s broadNo=%s center=%s:%s",
+            self._current.user_id,
+            bridge.broad_no or "?",
+            bridge.center_ip or "?",
+            bridge.center_port or "?",
+        )
         self._emit_state()
         if self._heartbeat and bridge.center_ip and bridge.center_port:
             self._heartbeat.switch_channel(
@@ -252,26 +474,45 @@ class SoopMiner:
                 result = await self._drops.claim_item(item.item_code_idx)
                 code = result.get("itemCode") if isinstance(result, dict) else None
                 if code:
-                    logger.info("已领取: %s  兑换码: %s", item.item_name, code)
+                    self._log.info("已领取: %s  兑换码: %s", item.item_name, code)
                 else:
-                    logger.info("已领取: %s", item.item_name)
+                    self._log.info("已领取: %s", item.item_name)
             except Exception as exc:
-                logger.error("领取失败 %s: %s", item.item_name, exc)
+                self._log.error("领取失败 %s: %s", item.item_name, exc)
         await self._refresh_inventory()
 
     async def _heartbeat_loop(self) -> None:
-        assert self._session
         tick = 0
         while not self._stop.is_set():
             if self._heartbeat and self._current:
-                if self._bridge is None:
-                    await self._ensure_bridge()
-                ok = await self._heartbeat.send(self._session)
-                if not ok:
-                    logger.warning("心跳发送失败")
+                try:
+                    await self._ensure_session()
+                    assert self._session
+                    if self._bridge is None:
+                        await self._ensure_bridge()
+                    ok = await self._heartbeat.send(self._session)
+                    if ok:
+                        self._heartbeat_fail_streak = 0
+                    else:
+                        self._heartbeat_fail_streak += 1
+                        self._log.warning("心跳发送失败")
+                except asyncio.CancelledError:
+                    raise
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    self._heartbeat_fail_streak += 1
+                    self._log.warning("心跳网络异常: %s", exc)
+                    await self._recover_network("心跳")
+                except RuntimeError as exc:
+                    if self._is_session_closed_error(exc):
+                        await self._recover_network("心跳")
+                    else:
+                        self._log.error("心跳异常: %s", exc)
+                except Exception as exc:
+                    self._heartbeat_fail_streak += 1
+                    self._log.warning("心跳异常: %s", exc)
                 tick += 1
-                if tick % 6 == 0:
-                    logger.debug("心跳 OK → %s", self._current.user_id)
+                if tick % 6 == 0 and self._heartbeat_fail_streak == 0:
+                    self._log.debug("心跳 OK → %s", self._current.user_id)
 
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=HEARTBEAT_INTERVAL)
@@ -287,15 +528,35 @@ class SoopMiner:
             if now >= mission_due:
                 try:
                     await self._refresh_missions()
+                except asyncio.CancelledError:
+                    raise
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    self._log.warning("刷新任务网络异常: %s", exc)
+                    await self._recover_network("任务刷新")
+                except RuntimeError as exc:
+                    if self._is_session_closed_error(exc):
+                        await self._recover_network("任务刷新")
+                    else:
+                        self._log.error("刷新任务失败: %s", exc)
                 except Exception as exc:
-                    logger.error("刷新任务失败: %s", exc)
+                    self._log.error("刷新任务失败: %s", exc)
                 mission_due = now + MISSION_POLL_INTERVAL
 
             if now >= inventory_due:
                 try:
                     await self._try_claim()
+                except asyncio.CancelledError:
+                    raise
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    self._log.warning("检查背包网络异常: %s", exc)
+                    await self._recover_network("背包")
+                except RuntimeError as exc:
+                    if self._is_session_closed_error(exc):
+                        await self._recover_network("背包")
+                    else:
+                        self._log.error("检查背包失败: %s", exc)
                 except Exception as exc:
-                    logger.error("检查背包失败: %s", exc)
+                    self._log.error("检查背包失败: %s", exc)
                 inventory_due = now + INVENTORY_POLL_INTERVAL
 
             try:
@@ -307,47 +568,69 @@ class SoopMiner:
     async def run(self) -> None:
         self._running = True
         self._stop.clear()
-        await self._refresh_missions()
+        mode_labels = {
+            "smart": "智能选台",
+            "manual": "手动选台",
+            "owesports": f"仅 {self._channel_config.preferred_bjid}",
+        }
+        self._log.info("直播间策略: %s", mode_labels.get(self._channel_config.mode, self._channel_config.mode))
+        await self._ensure_session()
+        if self._session:
+            await self._drops.ensure_drops_ready(on_info=self._log.info)
+        await self._refresh_missions(channel_first=True)
         if not self._current:
-            logger.error("无法开始：没有可用的 Drops 直播间")
+            self._log.error("无法开始：没有可用的 Drops 直播间")
             self._running = False
             self._emit_state("无可用直播间")
             return
 
-        logger.info("开始挂机 → %s (每 %.0fs 心跳)", self._current.user_id, HEARTBEAT_INTERVAL)
+        self._log.info(
+            "开始挂机 → %s (心跳 %.0fs · 任务刷新 %.0fs)",
+            self._current.user_id,
+            HEARTBEAT_INTERVAL,
+            MISSION_POLL_INTERVAL,
+        )
         try:
             await self._refresh_inventory()
         except Exception as exc:
-            logger.warning("加载背包失败: %s", exc)
+            self._log.warning("加载背包失败: %s", exc)
         self._emit_state("挂机中")
-        await asyncio.gather(self._heartbeat_loop(), self._poll_loop())
+        hb_task = asyncio.create_task(self._heartbeat_loop(), name=f"hb-{self.uid}")
+        poll_task = asyncio.create_task(self._poll_loop(), name=f"poll-{self.uid}")
+        try:
+            await asyncio.gather(hb_task, poll_task)
+        finally:
+            for task in (hb_task, poll_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(hb_task, poll_task, return_exceptions=True)
         self._running = False
         self._emit_state("已停止")
 
 
 async def run_miner(*, userid: str | None = None, password: str | None = None) -> None:
-    cookies = load_cookies()
+    from .multi_miner import MultiMinerManager
+
+    cookies_map = load_all_cookies()
     if userid and password:
-        cookies = await login(userid, password)
-    elif not cookies:
+        cookies_map[userid] = await login(userid, password)
+    elif not cookies_map:
         raise SystemExit("请先登录: python -m soop_miner --userid 账号 --password 密码")
 
     loop = asyncio.get_running_loop()
-    miner: SoopMiner | None = None
+    manager = MultiMinerManager()
 
-    async with SoopMiner(cookies) as m:
-        miner = m
+    def _handle_stop() -> None:
+        logger.info("正在停止...")
+        manager.stop_all()
 
-        def _handle_stop() -> None:
-            logger.info("正在停止...")
-            if miner:
-                miner.stop()
+    if hasattr(signal, "SIGINT"):
+        try:
+            loop.add_signal_handler(signal.SIGINT, _handle_stop)
+            loop.add_signal_handler(signal.SIGTERM, _handle_stop)
+        except NotImplementedError:
+            pass
 
-        if hasattr(signal, "SIGINT"):
-            try:
-                loop.add_signal_handler(signal.SIGINT, _handle_stop)
-                loop.add_signal_handler(signal.SIGTERM, _handle_stop)
-            except NotImplementedError:
-                pass
-
-        await m.run()
+    await manager.start_all(cookies_map)
+    await manager.wait()
+    await manager.shutdown()
