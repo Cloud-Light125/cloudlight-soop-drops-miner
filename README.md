@@ -44,7 +44,7 @@ SOOP Drops 的观看进度按**直播间分类 / 官方频道**累计。若账�
 
 ### 方式一：直接运行 exe（推荐给普通用户）
 
-1. 从 [Releases](https://github.com/yourname/soop-drops-miner/releases) 下载 `SOOP_Drops_Miner.exe`（请自行替换为实际发布地址）
+1. 从 [Releases](https://github.com/tom1230123/soop-drops-miner/releases) 下载 `SOOP_Drops_Miner.exe`（v1.0.1）
 2. 将 exe 放在任意文件夹中双击运行
 3. 首次启动需阅读并同意免责说明
 4. 在界面中添加账号后，点击顶部绿色 **「▶ 全部开始」** 即可挂机
