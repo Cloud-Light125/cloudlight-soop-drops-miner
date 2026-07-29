@@ -38,6 +38,13 @@ DATA_DIR = _resolve_data_dir()
 ACCOUNTS_DIR = DATA_DIR / "accounts"
 COOKIES_PATH = DATA_DIR / "cookies.json"  # 旧版单账号，启动时自动迁移
 
+
+def resource_path(name: str) -> Path:
+    """返回源码目录或 PyInstaller 临时解包目录中的只读资源。"""
+    bundled_root = getattr(sys, "_MEIPASS", None)
+    root = Path(bundled_root) if bundled_root else Path(__file__).resolve().parent
+    return root / name
+
 APP_NAME = "CloudLight SOOP Drops Miner"
 VERSION = "1.0"
 AUTHOR = "cloudlight"
@@ -47,6 +54,7 @@ GITHUB_REPOSITORY_URL = "https://github.com/yundan125/cloudlight-soop-drops-mine
 LICENSE_NAME = "未声明独立许可证（保留原仓库声明）"
 DEFAULT_CHANNEL_BJID = "owesports"
 WINDOW_TITLE = f"{APP_NAME} {VERSION}"
+APP_ICON_PATH = resource_path("soop.png")
 DISCLAIMER_ACCEPTED_PATH = DATA_DIR / ".disclaimer_accepted"
 
 DISCLAIMER_TEXT = """CloudLight SOOP Drops Miner 免责说明

@@ -12,7 +12,7 @@ from dataclasses import replace
 from typing import Any, Callable
 
 import customtkinter as ctk
-from tkinter import messagebox
+from tkinter import PhotoImage, messagebox
 
 from .auth import list_accounts, load_all_cookies, load_cookies, login, remove_account
 from .channel import (
@@ -26,6 +26,7 @@ from .channel import (
 from .config import AppConfig, SETTINGS_VERSION, load_settings, reset_settings, save_settings, snapshot_settings
 from .constants import (
     APP_NAME,
+    APP_ICON_PATH,
     AUTHOR,
     AUTHOR_BY,
     DEFAULT_CHANNEL_BJID,
@@ -102,6 +103,7 @@ class ModernSoopGui:
         if self._in_tray:
             self.root.withdraw()
         self.root.title(WINDOW_TITLE)
+        self._set_window_icon()
         self.root.geometry(WINDOW_SIZE)
         self.root.minsize(*MIN_WINDOW_SIZE)
 
@@ -168,6 +170,15 @@ class ModernSoopGui:
         self._start_restore_poll()
         self._refresh_header()
         logger.info("%s GUI 启动%s", WINDOW_TITLE, "（托盘模式）" if self._in_tray else "")
+
+    def _set_window_icon(self) -> None:
+        """为源码和打包模式设置同一份窗口图标。"""
+        try:
+            self._window_icon = PhotoImage(file=str(APP_ICON_PATH))
+            self.root.iconphoto(True, self._window_icon)
+        except Exception as exc:
+            self._window_icon = None
+            logger.warning("加载窗口图标失败：%s", exc)
 
     # ---------- construction ----------
     def _build_ui(self) -> None:

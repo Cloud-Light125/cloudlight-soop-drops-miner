@@ -29,6 +29,7 @@ SOURCE_NAMES = [
     "systray.py",
     "watch.py",
     "windows_startup.py",
+    "soop.png",
 ]
 
 a = Analysis(
@@ -78,4 +79,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(ROOT / "soop.png"),
 )

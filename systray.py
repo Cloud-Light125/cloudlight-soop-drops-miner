@@ -236,6 +236,10 @@ class WinSystray:
         wc = WNDCLASSW()
         wc.lpfnWndProc = self._wndproc_ref
         wc.hInstance = kernel32.GetModuleHandleW(None)
+        app_icon = user32.LoadIconW(wc.hInstance, ctypes.c_void_p(1))
+        if not app_icon:
+            app_icon = user32.LoadIconW(None, IDI_APPLICATION)
+        wc.hIcon = app_icon
         wc.lpszClassName = class_name
         atom = user32.RegisterClassW(ctypes.byref(wc))
         if atom == 0:
@@ -268,7 +272,7 @@ class WinSystray:
         nid.uID = 1
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         nid.uCallbackMessage = WM_TRAY
-        nid.hIcon = user32.LoadIconW(None, IDI_APPLICATION)
+        nid.hIcon = app_icon
         nid.szTip = self._tip
         shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
         self._added = True
