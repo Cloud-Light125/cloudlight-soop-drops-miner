@@ -4,12 +4,15 @@ import json
 import re
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from yarl import URL
 
 from .constants import ACCOUNTS_DIR, COOKIES_PATH, LOGIN_URL, USER_AGENT
+
+if TYPE_CHECKING:
+    from .config import AppConfig
 
 COOKIE_NAMES = (
     "AbroadChk",
@@ -110,8 +113,18 @@ def cookie_header(cookies: dict[str, str]) -> str:
     return "; ".join(f"{k}={v}" for k, v in cookies.items())
 
 
-async def login(userid: str, password: str) -> dict[str, str]:
-    async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as session:
+async def login(
+    userid: str,
+    password: str,
+    *,
+    config: AppConfig | None = None,
+) -> dict[str, str]:
+    from .config import AppConfig
+    from .network import AccountNetworkContext
+
+    context = AccountNetworkContext(userid, {}, config or AppConfig())
+    session = await context.open()
+    try:
         async with session.post(
             LOGIN_URL,
             data={
@@ -132,6 +145,8 @@ async def login(userid: str, password: str) -> dict[str, str]:
                 for cookie in session.cookie_jar:
                     if cookie.key in COOKIE_NAMES or cookie.key in cookies:
                         cookies[cookie.key] = cookie.value
+    finally:
+        await context.close()
 
     if "AuthTicket" not in cookies and "BbsTicket" not in cookies:
         raise RuntimeError("登录未返回有效 Ticket Cookie")

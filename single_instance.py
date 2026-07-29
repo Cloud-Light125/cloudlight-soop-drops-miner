@@ -8,7 +8,7 @@ from .constants import APP_NAME, WINDOW_TITLE
 # 进程存活期间保持 mutex 句柄，避免被 GC 释放后允许多开
 _mutex_handle: int | None = None
 
-_MUTEX_NAME = "Global\\SOOP_Drops_Miner_SingleInstance"
+_MUTEX_NAME = "Global\\CloudLight_SOOP_Drops_Miner_SingleInstance"
 _ERROR_ALREADY_EXISTS = 183
 _SW_RESTORE = 9
 _SW_SHOW = 5
@@ -31,6 +31,18 @@ def ensure_single_instance_or_exit() -> bool:
         _activate_existing_window()
         return False
     return True
+
+
+def release_single_instance() -> None:
+    global _mutex_handle
+    if sys.platform != "win32" or not _mutex_handle:
+        _mutex_handle = None
+        return
+    import ctypes
+
+    handle, _mutex_handle = _mutex_handle, None
+    ctypes.windll.kernel32.ReleaseMutex(handle)
+    ctypes.windll.kernel32.CloseHandle(handle)
 
 
 def _try_acquire_mutex() -> bool:

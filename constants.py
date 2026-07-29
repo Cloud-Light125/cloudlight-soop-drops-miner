@@ -9,6 +9,7 @@ LOGIN_URL = "https://login.sooplive.co.kr/app/LoginAction.php"
 DROPS_ORIGIN = "https://drops.sooplive.com"
 DROPS_MISSION_URL = f"{DROPS_ORIGIN}/mission"
 DROPS_EVENT_URL = f"{DROPS_ORIGIN}/event"
+DROPS_INVENTORY_URL = f"{DROPS_ORIGIN}/inventory"
 DROPS_API = f"{DROPS_ORIGIN}/api"
 GATHER_URL = "https://exlogcollector.sooplive.com/gather"
 PLAY_ORIGIN = "https://play.sooplive.com"
@@ -37,15 +38,18 @@ DATA_DIR = _resolve_data_dir()
 ACCOUNTS_DIR = DATA_DIR / "accounts"
 COOKIES_PATH = DATA_DIR / "cookies.json"  # 旧版单账号，启动时自动迁移
 
-APP_NAME = "SOOP Drops Miner"
-VERSION = "v1.0.1"
-AUTHOR = "www5329"
+APP_NAME = "CloudLight SOOP Drops Miner"
+VERSION = "1.0"
+AUTHOR = "cloudlight"
 AUTHOR_BY = f"by {AUTHOR}"
+PAGE_SUBTITLE = "SOOP Drops 多账号任务管理"
+GITHUB_REPOSITORY_URL = "https://github.com/yundan125/cloudlight-soop-drops-miner"
+LICENSE_NAME = "未声明独立许可证（保留原仓库声明）"
 DEFAULT_CHANNEL_BJID = "owesports"
 WINDOW_TITLE = f"{APP_NAME} {VERSION}"
 DISCLAIMER_ACCEPTED_PATH = DATA_DIR / ".disclaimer_accepted"
 
-DISCLAIMER_TEXT = """SOOP Drops Miner 免责说明
+DISCLAIMER_TEXT = """CloudLight SOOP Drops Miner 免责说明
 
 1. 本软件为第三方辅助工具，与 SOOP Live / AfreecaTV 官方无任何关联，亦未获官方授权或认可。
 

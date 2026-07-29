@@ -1,12 +1,16 @@
-# SOOP Drops Miner
+﻿# CloudLight SOOP Drops Miner
 
 SOOP Live（原 AfreecaTV）掉宝挂机工具，支持多账号并行、图形界面操作与奖励背包汇总。
 
 > 第三方辅助工具，与 SOOP Live 官方无任何关联，亦未获官方授权。使用风险由使用者自行承担，详见软件内「免责说明」。
 
-**by www5329**
+**by cloudlight**
 
 📖 **开发者文档**：[docs/PROJECT.md](docs/PROJECT.md)（架构、模块、API、数据流等详细说明）
+
+🌐 **GitHub**：[yundan125/cloudlight-soop-drops-miner](https://github.com/yundan125/cloudlight-soop-drops-miner)
+
+许可证状态：当前仓库未声明独立许可证；保留原仓库中的既有声明与历史。
 
 ---
 
@@ -21,6 +25,7 @@ SOOP Live（原 AfreecaTV）掉宝挂机工具，支持多账号并行、图形�
 - **奖励背包**：汇总各账号已领取奖励，支持复制兑换码
 - **网络恢复**：HTTP / 心跳超时后自动重建会话，避免整账号因单次网络抖动退出
 - **命令行模式**：无图形界面时可用 CLI 多账号运行（可选）
+- **现代单页面**：CustomTkinter 圆角卡片、浅色/深色/跟随系统主题，账号、任务、背包与日志增量更新
 
 ---
 
@@ -44,7 +49,7 @@ SOOP Drops 的观看进度按**直播间分类 / 官方频道**累计。若账�
 
 ### 方式一：直接运行 exe（推荐给普通用户）
 
-1. 从 [Releases](https://github.com/tom1230123/soop-drops-miner/releases) 下载 `SOOP_Drops_Miner.exe`（v1.0.1）
+1. 从 [项目 Releases](https://github.com/yundan125/cloudlight-soop-drops-miner/releases) 下载 `CloudLight_SOOP_Drops_Miner.exe`（1.0）
 2. 将 exe 放在任意文件夹中双击运行
 3. 首次启动需阅读并同意免责说明
 4. 在界面中添加账号后，点击顶部绿色 **「▶ 全部开始」** 即可挂机
@@ -54,19 +59,19 @@ SOOP Drops 的观看进度按**直播间分类 / 官方频道**累计。若账�
 ### 方式二：源码运行（开发者）
 
 ```bat
-# 克隆仓库后，在项目根目录（soop_miner 的上一级）执行：
+# 克隆仓库后，在项目根目录执行：
 
-cd soop_miner
+cd "cloudlight soop drops miner"
 pip install -r requirements.txt
 
-# 或直接使用 run.bat（会自动检查 websockets 依赖）
+# 或直接使用 run.bat
 run.bat
 ```
 
 等价命令：
 
 ```bat
-python -m soop_miner --gui
+python entry.py --gui
 ```
 
 ---
@@ -75,7 +80,7 @@ python -m soop_miner --gui
 
 ### 1. 添加账号
 
-1. 打开 **「多账号挂机」** 标签页
+1. 在单页面顶部的 **「账号管理」** 卡片中操作
 2. 在账号列表上方输入 SOOP **账号** 与 **密码**
 3. 点击 **「添加」** 保存（cookies 写入本地，下次无需重复输入密码）
 
@@ -125,7 +130,11 @@ python -m soop_miner --gui
 
 ### 6. 奖励背包
 
-切换到 **「奖励背包」** 标签页，可查看所有已保存账号的奖励记录，双击条目或点击 **「复制选中」** / **「复制全部兑换码」** 复制兑换码。点击 **「刷新背包」** 从服务器拉取最新数据。
+展开单页面中的 **「奖励背包」** 卡片，可查看所有已保存账号的奖励记录，并使用 **「复制兑换码」** / **「复制全部」**。兑换码默认掩码显示，只有复制操作读取完整值；点击 **「刷新背包」** 从服务器拉取最新数据。
+
+### 7. 设置与主题
+
+展开同一页面中的 **「设置」** 卡片，可配置开机自启、静默托盘、代理、自动领取、低流量模式、刷新间隔，以及跟随系统/浅色/深色主题。代理测试在后台运行，不阻塞主窗口。
 
 ---
 
@@ -134,7 +143,7 @@ python -m soop_miner --gui
 加载已保存的全部账号并并行挂机：
 
 ```bat
-python -m soop_miner --cli --userid 你的账号 --password 你的密码
+python entry.py --cli --userid 你的账号 --password 你的密码
 ```
 
 增加 `-v` 可输出更详细的调试日志。
@@ -149,6 +158,7 @@ python -m soop_miner --cli --userid 你的账号 --password 你的密码
 |------|------|
 | `accounts/<账号>/cookies.json` | 各账号登录会话（含 AuthTicket 等） |
 | `cookies.json` | 旧版单账号数据（若存在会自动迁移到 `accounts/`） |
+| `settings.json` | 统一应用设置（代理、托盘、自启与轮询间隔） |
 | `.disclaimer_accepted` | 是否已同意免责说明 |
 
 提交前可自检：
@@ -164,7 +174,7 @@ git check-ignore -v accounts\你的账号\cookies.json
 
 ## 开源仓库范围说明
 
-本仓库**仅包含** SOOP Drops Miner 正式运行代码（`soop_miner/` 内 Python 模块、GUI、打包配置与文档）。
+本仓库**仅包含** CloudLight SOOP Drops Miner 正式运行代码（`仓库根目录` 内 Python 模块、GUI、打包配置与文档）。
 
 以下内容**不在开源范围内**，请保留在本地，不要 `git add`：
 
@@ -174,19 +184,19 @@ git check-ignore -v accounts\你的账号\cookies.json
 | 抓包/HAR | `*.har`、`*_probe/`、`*_dump.json` | 可能含 Cookie 与内部 API 响应 |
 | 开发辅助脚本 | 上级目录 `soop_tools/` | 本地逆向、探测用，非运行时依赖 |
 
-`soop_tools/` 与主程序目录同级，默认不在 `soop_miner` 仓库内；若在其它目录自行维护，请单独配置忽略规则。
+`soop_tools/` 与主程序目录同级，默认不在本仓库内；若在其它目录自行维护，请单独配置忽略规则。
 
 ---
 
 ## 自行打包 exe
 
-在 `soop_miner` 目录执行：
+在仓库根目录执行：
 
 ```bat
 build.bat
 ```
 
-成功后输出：`dist/SOOP_Drops_Miner.exe`
+成功后输出：`dist/CloudLight_SOOP_Drops_Miner.exe`
 
 打包脚本**不会**将本地 `cookies.json` 或 `accounts/` 打入 exe，可单独分发 exe 文件。
 

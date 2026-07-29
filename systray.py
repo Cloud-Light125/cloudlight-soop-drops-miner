@@ -4,6 +4,7 @@ from __future__ import annotations
 import ctypes
 import sys
 import threading
+from dataclasses import dataclass
 from ctypes import wintypes
 from typing import Callable
 
@@ -25,17 +26,37 @@ WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONUP = 0x0205
 IDI_APPLICATION = 32512
 MF_STRING = 0x0000
+MF_GRAYED = 0x0001
 MF_SEPARATOR = 0x0000800
 TPM_BOTTOMALIGN = 0x0020
 TPM_RIGHTALIGN = 0x0080
 TPM_RETURNCMD = 0x0100
 ID_SHOW = 1001
-ID_EXIT = 1002
+ID_START_ALL = 1002
+ID_STOP_ALL = 1003
+ID_EXIT = 1004
 
 LRESULT = ctypes.c_ssize_t
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 _ERROR_CLASS_ALREADY_EXISTS = 1410
 _configured = False
+
+
+@dataclass(frozen=True, slots=True)
+class TrayMenuState:
+    account_count: int = 0
+    running_count: int = 0
+    proxy_enabled: bool = False
+    low_bandwidth_mode: bool = True
+    busy: bool = False
+
+    @property
+    def can_start(self) -> bool:
+        return self.account_count > 0 and self.running_count == 0 and not self.busy
+
+    @property
+    def can_stop(self) -> bool:
+        return self.running_count > 0 or self.busy
 
 
 def _configure_win32_api() -> tuple[ctypes.WinDLL, ctypes.WinDLL]:
@@ -85,6 +106,32 @@ def _configure_win32_api() -> tuple[ctypes.WinDLL, ctypes.WinDLL]:
     user32.PostQuitMessage.argtypes = [ctypes.c_int]
     user32.PostQuitMessage.restype = None
 
+    user32.CreatePopupMenu.argtypes = []
+    user32.CreatePopupMenu.restype = wintypes.HMENU
+    user32.AppendMenuW.argtypes = [
+        wintypes.HMENU,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPCWSTR,
+    ]
+    user32.AppendMenuW.restype = wintypes.BOOL
+    user32.TrackPopupMenu.argtypes = [
+        wintypes.HMENU,
+        wintypes.UINT,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.HWND,
+        ctypes.c_void_p,
+    ]
+    user32.TrackPopupMenu.restype = wintypes.UINT
+    user32.DestroyMenu.argtypes = [wintypes.HMENU]
+    user32.DestroyMenu.restype = wintypes.BOOL
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+    user32.GetCursorPos.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+
     _configured = True
     return user32, kernel32
 
@@ -109,16 +156,22 @@ class WinSystray:
         *,
         tip: str,
         on_show: Callable[[], None],
+        on_start_all: Callable[[], None],
+        on_stop_all: Callable[[], None],
         on_exit: Callable[[], None],
     ) -> None:
         self._tip = tip[:127]
         self._on_show = on_show
+        self._on_start_all = on_start_all
+        self._on_stop_all = on_stop_all
         self._on_exit = on_exit
         self._thread = threading.Thread(target=self._message_loop, name="Systray", daemon=True)
         self._ready = threading.Event()
         self._hwnd: int = 0
         self._added = False
         self._wndproc_ref = None
+        self._state = TrayMenuState()
+        self._state_lock = threading.Lock()
 
     def start(self) -> None:
         if sys.platform != "win32":
@@ -131,6 +184,12 @@ class WinSystray:
             return
         user32 = ctypes.windll.user32
         user32.PostMessageW(self._hwnd, WM_DESTROY, 0, 0)
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=3.0)
+
+    def update_state(self, state: TrayMenuState) -> None:
+        with self._state_lock:
+            self._state = state
 
     def _message_loop(self) -> None:
         user32, kernel32 = _configure_win32_api()
@@ -160,6 +219,10 @@ class WinSystray:
                 cmd = wparam & 0xFFFF
                 if cmd == ID_SHOW:
                     self._invoke(self._on_show)
+                elif cmd == ID_START_ALL:
+                    self._invoke(self._on_start_all)
+                elif cmd == ID_STOP_ALL:
+                    self._invoke(self._on_stop_all)
                 elif cmd == ID_EXIT:
                     self._invoke(self._on_exit)
             elif msg == WM_DESTROY:
@@ -169,7 +232,7 @@ class WinSystray:
             return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
         self._wndproc_ref = WNDPROC(_wnd_proc)
-        class_name = "SoopDropsMinerTrayWnd"
+        class_name = "CloudLightSoopDropsMinerTrayWnd"
         wc = WNDCLASSW()
         wc.lpfnWndProc = self._wndproc_ref
         wc.hInstance = kernel32.GetModuleHandleW(None)
@@ -184,7 +247,7 @@ class WinSystray:
         self._hwnd = user32.CreateWindowExW(
             0,
             class_name,
-            "SoopDropsMinerTray",
+            "CloudLightSoopDropsMinerTray",
             0,
             0,
             0,
@@ -215,6 +278,7 @@ class WinSystray:
         while user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
+        self._hwnd = 0
 
     def _remove_icon(self) -> None:
         if not self._added or not self._hwnd:
@@ -228,10 +292,39 @@ class WinSystray:
 
     def _popup_menu(self, hwnd: int) -> None:
         user32 = ctypes.windll.user32
+        with self._state_lock:
+            state = self._state
         menu = user32.CreatePopupMenu()
-        user32.AppendMenuW(menu, MF_STRING, ID_SHOW, "显示窗口")
+        user32.AppendMenuW(menu, MF_STRING, ID_SHOW, "显示主窗口")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        user32.AppendMenuW(menu, MF_STRING, ID_EXIT, "退出")
+        user32.AppendMenuW(
+            menu,
+            MF_STRING if state.can_start else MF_STRING | MF_GRAYED,
+            ID_START_ALL,
+            "全部开始",
+        )
+        user32.AppendMenuW(
+            menu,
+            MF_STRING if state.can_stop else MF_STRING | MF_GRAYED,
+            ID_STOP_ALL,
+            "全部停止",
+        )
+        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        user32.AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, f"运行中：{state.running_count} 个账号")
+        user32.AppendMenuW(
+            menu,
+            MF_STRING | MF_GRAYED,
+            0,
+            f"代理：{'已启用' if state.proxy_enabled else '未启用'}",
+        )
+        user32.AppendMenuW(
+            menu,
+            MF_STRING | MF_GRAYED,
+            0,
+            f"低流量：{'已启用' if state.low_bandwidth_mode else '未启用'}",
+        )
+        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        user32.AppendMenuW(menu, MF_STRING, ID_EXIT, "退出程序")
         pos = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pos))
         user32.SetForegroundWindow(hwnd)
@@ -244,7 +337,8 @@ class WinSystray:
             hwnd,
             None,
         )
-        user32.PostMessageW(hwnd, WM_COMMAND, cmd, 0)
+        if cmd:
+            user32.PostMessageW(hwnd, WM_COMMAND, cmd, 0)
         user32.DestroyMenu(menu)
 
     @staticmethod
@@ -259,11 +353,19 @@ def create_systray(
     *,
     tip: str,
     on_show: Callable[[], None],
+    on_start_all: Callable[[], None],
+    on_stop_all: Callable[[], None],
     on_exit: Callable[[], None],
 ) -> WinSystray | None:
     if sys.platform != "win32":
         return None
-    tray = WinSystray(tip=tip, on_show=on_show, on_exit=on_exit)
+    tray = WinSystray(
+        tip=tip,
+        on_show=on_show,
+        on_start_all=on_start_all,
+        on_stop_all=on_stop_all,
+        on_exit=on_exit,
+    )
     tray.start()
     return tray
 

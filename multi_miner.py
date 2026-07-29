@@ -7,6 +7,7 @@ from typing import Callable
 from .channel import ChannelConfig
 from .auth import load_all_cookies, userid_from_cookies
 from .miner import MinerState, SoopMiner
+from .config import AppConfig, load_settings, snapshot_settings
 
 logger = logging.getLogger("SoopDropsMiner")
 
@@ -20,9 +21,11 @@ class MultiMinerManager:
         self,
         on_state: StateCallback | None = None,
         channel_config: ChannelConfig | None = None,
+        app_config: AppConfig | None = None,
     ) -> None:
         self._on_state = on_state
         self._channel_config = channel_config
+        self._app_config = snapshot_settings(app_config or load_settings())
         self._miners: dict[str, SoopMiner] = {}
         self._tasks: dict[str, asyncio.Task] = {}
 
@@ -63,6 +66,7 @@ class MultiMinerManager:
             cookies,
             on_state=self._callback,
             channel_config=self._channel_config,
+            app_config=snapshot_settings(self._app_config),
         )
         await miner.__aenter__()
         self._miners[uid] = miner
@@ -83,6 +87,10 @@ class MultiMinerManager:
     def stop_account(self, uid: str) -> None:
         if uid in self._miners:
             self._miners[uid].stop()
+
+    async def stop_account_and_wait(self, uid: str) -> None:
+        """Stop one account and wait until its network resources are closed."""
+        await self._cleanup_uid(uid)
 
     def stop_all(self) -> None:
         for miner in self._miners.values():

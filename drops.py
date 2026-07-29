@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable
 
 import aiohttp
@@ -9,6 +11,27 @@ from .constants import DROPS_API, DROPS_EVENT_URL, DROPS_MISSION_URL, DROPS_ORIG
 from .models import DropEvent, InventoryItem, Mission
 
 logger = logging.getLogger("SoopDropsMiner")
+
+
+class ClaimStatus(str, Enum):
+    CLAIMED = "claimed"
+    ALREADY_CLAIMED = "already_claimed"
+    NOT_CLAIMABLE = "not_claimable"
+    UNCONFIRMED = "unconfirmed"
+    FAILED = "failed"
+
+
+@dataclass(slots=True)
+class ClaimResult:
+    item_code_idx: str
+    status: ClaimStatus
+    message: str
+    redeem_code: str | None = None
+    attempts: int = 0
+
+    @property
+    def success(self) -> bool:
+        return self.status in {ClaimStatus.CLAIMED, ClaimStatus.ALREADY_CLAIMED}
 
 
 class DropsClient:
@@ -35,6 +58,8 @@ class DropsClient:
             if resp.status == 401 or (isinstance(data, dict) and data.get("result") == -1):
                 msg = data.get("message", "未登录") if isinstance(data, dict) else "未登录"
                 raise RuntimeError(f"Drops API 认证失败: {msg}")
+            if resp.status >= 400:
+                raise RuntimeError(f"Drops API HTTP {resp.status}")
             return data
 
     async def get_drops_enabled(self) -> bool | None:
@@ -173,7 +198,10 @@ class DropsClient:
 
         if with_codes:
             for item in items:
-                await self._fill_redeem_code(item)
+                # get_drops_use_info.php is the only known detail/use endpoint.  Do
+                # not touch an unclaimed row merely to decorate the inventory.
+                if item.claimed:
+                    await self._fill_redeem_code(item)
         return items
 
     async def _fill_redeem_code(self, item: InventoryItem) -> None:
@@ -191,14 +219,81 @@ class DropsClient:
             item.description = str(desc)
 
     async def get_item_detail(self, item_code_idx: str) -> dict[str, Any]:
-        data = await self._request(
+        data = await self.get_item_detail_response(item_code_idx)
+        payload = data.get("data") or data
+        return payload if isinstance(payload, dict) else {}
+
+    async def get_item_detail_response(self, item_code_idx: str) -> dict[str, Any]:
+        return await self._request(
             "POST",
             "get_drops_use_info.php",
             json_body={"itemCodeIdx": item_code_idx},
             referer=f"{DROPS_ORIGIN}/inventory",
         )
-        payload = data.get("data") or data
-        return payload if isinstance(payload, dict) else {}
 
     async def claim_item(self, item_code_idx: str) -> dict[str, Any]:
-        return await self.get_item_detail(item_code_idx)
+        """Call the only repository-confirmed use/detail endpoint.
+
+        This method intentionally does not claim success; callers must verify the
+        inventory transition with :meth:`claim_and_verify`.
+        """
+        return await self.get_item_detail_response(item_code_idx)
+
+    @staticmethod
+    def _claim_response_confirmed(data: dict[str, Any]) -> bool:
+        checks = (
+            data.get("result") in (1, "1", True),
+            data.get("success") is True,
+            data.get("nRet") in (0, "0"),
+        )
+        return any(checks)
+
+    async def claim_and_verify(
+        self,
+        item_code_idx: str,
+        *,
+        max_attempts: int = 2,
+    ) -> ClaimResult:
+        max_attempts = max(1, min(int(max_attempts), 3))
+        before_items = await self.get_inventory(with_codes=False)
+        before = next((item for item in before_items if item.item_code_idx == item_code_idx), None)
+        if before is None:
+            return ClaimResult(item_code_idx, ClaimStatus.NOT_CLAIMABLE, "背包中不存在该物品")
+        if before.claimed:
+            return ClaimResult(item_code_idx, ClaimStatus.ALREADY_CLAIMED, "物品已处于领取状态")
+
+        last_message = "领取接口未确认"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await self.claim_item(item_code_idx)
+                response_ok = self._claim_response_confirmed(response)
+                after_items = await self.get_inventory(with_codes=False)
+                after = next((item for item in after_items if item.item_code_idx == item_code_idx), None)
+                changed = after is not None and not before.claimed and after.claimed
+                if response_ok and changed:
+                    payload = response.get("data") if isinstance(response.get("data"), dict) else response
+                    code = payload.get("itemCode") if isinstance(payload, dict) else None
+                    return ClaimResult(
+                        item_code_idx,
+                        ClaimStatus.CLAIMED,
+                        "接口明确成功且 Inventory useFlag 已变为 Y",
+                        str(code) if code else None,
+                        attempt,
+                    )
+                if not response_ok:
+                    last_message = "领取接口未返回明确成功字段"
+                elif not changed:
+                    last_message = "领取接口响应成功，但 Inventory useFlag 未变化"
+            except Exception as exc:
+                last_message = f"领取请求失败: {exc}"
+            if attempt < max_attempts:
+                import asyncio
+
+                await asyncio.sleep(attempt)
+
+        return ClaimResult(
+            item_code_idx,
+            ClaimStatus.UNCONFIRMED,
+            last_message,
+            attempts=max_attempts,
+        )

@@ -9,6 +9,8 @@ accounts/
 *.json.bak
 .disclaimer_accepted
 .show_window
+config.json
+settings.json
 
 # =============================================================================
 # 抓包、探测产物（可能含 Cookie / 会话信息）

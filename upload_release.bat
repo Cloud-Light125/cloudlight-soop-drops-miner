@@ -1,15 +1,15 @@
-@echo off
+﻿@echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
 
 set "HTTP_PROXY=http://127.0.0.1:7890"
 set "HTTPS_PROXY=http://127.0.0.1:7890"
 
-set "OWNER=tom1230123"
-set "REPO=soop-drops-miner"
-set "TAG=v1.0.1"
-set "EXE_PATH=%~dp0..\dist\SOOP_Drops_Miner.exe"
-set "ASSET_NAME=SOOP_Drops_Miner.exe"
+set "OWNER=yundan125"
+set "REPO=cloudlight-soop-drops-miner"
+set "TAG=v1.0"
+set "EXE_PATH=%~dp0dist\CloudLight_SOOP_Drops_Miner.exe"
+set "ASSET_NAME=CloudLight_SOOP_Drops_Miner.exe"
 
 if not exist "%EXE_PATH%" (
     echo [ERROR] Exe not found:
@@ -37,7 +37,7 @@ curl -sS -H "Authorization: token %GITHUB_TOKEN%" -H "Accept: application/vnd.gi
 findstr /c:"upload_url" "%RELEASE_JSON%" >nul 2>&1
 if errorlevel 1 (
     echo Creating release for tag %TAG%...
-    curl -sS -X POST -H "Authorization: token %GITHUB_TOKEN%" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/%OWNER%/%REPO%/releases" -d "{\"tag_name\":\"%TAG%\",\"name\":\"SOOP Drops Miner %TAG%\",\"body\":\"Windows build. Multi-account, systray, channel picker, GUI overhaul.\",\"draft\":false,\"prerelease\":false}" > "%RELEASE_JSON%"
+    curl -sS -X POST -H "Authorization: token %GITHUB_TOKEN%" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/%OWNER%/%REPO%/releases" -d "{\"tag_name\":\"%TAG%\",\"name\":\"CloudLight SOOP Drops Miner %TAG%\",\"body\":\"Windows build. Multi-account, systray, channel picker, GUI overhaul.\",\"draft\":false,\"prerelease\":false}" > "%RELEASE_JSON%"
     findstr /c:"upload_url" "%RELEASE_JSON%" >nul 2>&1
     if errorlevel 1 (
         echo [ERROR] Failed to create release:

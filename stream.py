@@ -21,7 +21,13 @@ async def head_latest_segment(
     playlist_url: str,
     *,
     bjid: str,
+    low_bandwidth_mode: bool = True,
 ) -> bool:
+    # This is a diagnostics-only helper.  The default low-bandwidth policy must
+    # never fetch a playlist or touch a media segment URL.
+    if low_bandwidth_mode:
+        logger.debug("低流量模式已阻止 HLS playlist/segment 探测")
+        return False
     headers = {
         "User-Agent": USER_AGENT,
         "Referer": f"{PLAY_ORIGIN}/{bjid}",
@@ -47,7 +53,12 @@ async def head_latest_segment(
 
     if chunk.endswith(".m3u8") or "m3u8" in chunk:
         nested_url = _resolve_url(playlist_url, chunk)
-        return await head_latest_segment(session, nested_url, bjid=bjid)
+        return await head_latest_segment(
+            session,
+            nested_url,
+            bjid=bjid,
+            low_bandwidth_mode=False,
+        )
 
     seg_url = _resolve_url(playlist_url, chunk)
     try:

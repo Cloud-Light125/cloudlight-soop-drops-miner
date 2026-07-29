@@ -9,38 +9,32 @@ from typing import Any, Callable
 
 import aiohttp
 
-from .auth import apply_cookies, load_cookies, login, userid_from_cookies
+from .auth import login, userid_from_cookies
 from .center import BridgeSession
+from .config import AppConfig, load_settings, snapshot_settings
 from .constants import (
     HEARTBEAT_INTERVAL,
-    HTTP_CONNECT_TIMEOUT,
-    HTTP_TOTAL_TIMEOUT,
-    INVENTORY_POLL_INTERVAL,
-    MISSION_POLL_INTERVAL,
     NETWORK_RECOVER_COOLDOWN,
 )
-from .drops import DropsClient
+from .drops import ClaimStatus, DropsClient
 from .channel import (
     ChannelConfig,
     ONE_STREAM_NOTICE,
-    PRIORITY_MISSION_AUTO,
     active_progress_missions,
     channel_matches_mission_category,
     collect_mission_channels,
     ended_fixed_missions,
-    filter_missions_by_priority,
-    format_channel_preview,
     has_active_fixed_missions,
     has_active_lottery_missions,
     is_category_fixed_mission,
     manual_channel_mismatch_warnings,
     mission_progresses_on_channel,
-    mission_pick_label,
     missions_for_channel,
     pick_channel,
 )
 from .models import InventoryItem, LiveChannel, Mission
 from .watch import WatchHeartbeat
+from .network import AccountNetworkContext, AccountSession
 
 logger = logging.getLogger("SoopDropsMiner")
 
@@ -65,6 +59,17 @@ class MinerState:
     missions: list[Mission] = field(default_factory=list)
     inventory: list[InventoryItem] = field(default_factory=list)
     available_channels: list[LiveChannel] = field(default_factory=list)
+    heartbeat_last_success: str | None = None
+    heartbeat_failures: int = 0
+    heartbeat_result: str | None = None
+    connection_healthy: bool = False
+    network_uploaded: int = 0
+    network_downloaded: int = 0
+    network_last_minute_bps: float = 0.0
+    network_upload_bps: float = 0.0
+    network_download_bps: float = 0.0
+    bridge_last_activity_seconds: float | None = None
+    network_estimated: bool = True
 
 
 class SoopMiner:
@@ -74,13 +79,16 @@ class SoopMiner:
         *,
         on_state: StateCallback | None = None,
         channel_config: ChannelConfig | None = None,
+        app_config: AppConfig | None = None,
     ):
         self.cookies = cookies
         self.uid = userid_from_cookies(cookies)
         self._log = _AccountLogAdapter(logger, {"uid": self.uid})
         self._on_state = on_state
         self._channel_config = channel_config or ChannelConfig()
-        self._session: aiohttp.ClientSession | None = None
+        self._app_config = snapshot_settings(app_config or load_settings())
+        self._network = AccountNetworkContext(self.uid, self.cookies, self._app_config)
+        self._session: AccountSession | None = None
         self._drops: DropsClient | None = None
         self._heartbeat: WatchHeartbeat | None = None
         self._bridge: BridgeSession | None = None
@@ -96,47 +104,49 @@ class SoopMiner:
         self._had_missions = False
         self._last_network_recover = 0.0
         self._heartbeat_fail_streak = 0
+        self._claimed_or_attempted: set[str] = set()
+        self._bridge_lock = asyncio.Lock()
+        self._recover_lock = asyncio.Lock()
+        self._bridge_failed = asyncio.Event()
 
     @staticmethod
     def _is_session_closed_error(exc: BaseException) -> bool:
         return isinstance(exc, RuntimeError) and "session is closed" in str(exc).lower()
 
-    def _new_http_session(self) -> aiohttp.ClientSession:
-        timeout = aiohttp.ClientTimeout(
-            total=HTTP_TOTAL_TIMEOUT,
-            connect=HTTP_CONNECT_TIMEOUT,
-        )
-        session = aiohttp.ClientSession(timeout=timeout)
-        apply_cookies(session, self.cookies)
-        return session
-
     async def _ensure_session(self) -> None:
         if self._session is not None and not self._session.closed:
             return
-        if self._session is not None:
-            await self._session.close()
-        self._session = self._new_http_session()
+        self._session = await self._network.open()
         self._drops = DropsClient(self._session)
 
     async def _recover_network(self, reason: str) -> None:
-        now = time.monotonic()
-        if now - self._last_network_recover < NETWORK_RECOVER_COOLDOWN:
-            return
-        self._last_network_recover = now
-        self._log.warning("网络异常，正在恢复会话 (%s)…", reason)
-        if self._bridge:
-            try:
-                await self._bridge.close()
-            except Exception:
-                pass
-            self._bridge = None
-        if self._session is not None and not self._session.closed:
-            await self._session.close()
-        self._session = None
-        await self._ensure_session()
-        self._heartbeat_fail_streak = 0
-        self._log.info("HTTP 会话已恢复")
-        self._emit_state("重连中")
+        async with self._recover_lock:
+            now = time.monotonic()
+            if now - self._last_network_recover < NETWORK_RECOVER_COOLDOWN:
+                return
+            self._last_network_recover = now
+            self._log.warning("网络异常，正在恢复账号独立会话 (%s)…", reason)
+            if self._bridge:
+                try:
+                    await self._bridge.close()
+                except Exception:
+                    pass
+                self._bridge = None
+            self._session = await self._network.recreate()
+            self._drops = DropsClient(self._session)
+            self._bridge_failed.clear()
+            self._emit_state("重连中")
+            if self._current and not self._stop.is_set():
+                await self._ensure_bridge()
+                if self._heartbeat and self._bridge and self._bridge.is_connected:
+                    try:
+                        if await self._heartbeat.send(self._session):
+                            self._heartbeat_fail_streak = 0
+                            self._log.info("账号会话已重建并恢复心跳")
+                            return
+                    except Exception as exc:
+                        self._log.warning("重建后的首次心跳失败: %s", exc)
+            self._log.warning("账号会话已重建，但尚未确认心跳恢复")
 
     def _log_stall(self, mission: Mission, item) -> None:
         bridge_ok = self._bridge is not None and self._bridge.is_connected
@@ -196,9 +206,10 @@ class SoopMiner:
     async def __aexit__(self, *args: Any) -> None:
         if self._bridge:
             await self._bridge.close()
-        if self._session and not self._session.closed:
-            await self._session.close()
+        self._bridge = None
+        await self._network.close()
         self._session = None
+        self._drops = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -206,6 +217,8 @@ class SoopMiner:
         self._emit_state("已停止")
 
     def get_state(self) -> MinerState:
+        heartbeat = self._heartbeat
+        stats = self._network.stats
         return MinerState(
             uid=self.uid,
             running=self._running and not self._stop.is_set(),
@@ -217,6 +230,20 @@ class SoopMiner:
             missions=list(self._missions),
             inventory=list(self._inventory),
             available_channels=collect_mission_channels(self._missions),
+            heartbeat_last_success=(
+                heartbeat.last_success_time.isoformat() if heartbeat and heartbeat.last_success_time else None
+            ),
+            heartbeat_failures=heartbeat.consecutive_failures if heartbeat else 0,
+            heartbeat_result=heartbeat.last_response_result if heartbeat else None,
+            connection_healthy=bool(
+                heartbeat and heartbeat.connection_healthy and self._bridge and self._bridge.is_connected
+            ),
+            network_uploaded=stats.uploaded,
+            network_downloaded=stats.downloaded,
+            network_last_minute_bps=stats.last_minute_bps,
+            network_upload_bps=stats.last_minute_upload_bps,
+            network_download_bps=stats.last_minute_download_bps,
+            bridge_last_activity_seconds=(self._bridge.seconds_since_last_activity if self._bridge else None),
         )
 
     def _status_text(self) -> str:
@@ -422,16 +449,31 @@ class SoopMiner:
 
     async def _ensure_bridge(self) -> None:
         assert self._session and self._current
-        if self._bridge is not None:
-            return
-        bridge = BridgeSession(self.cookies, self._current.user_id)
-        try:
-            await bridge.connect(self._session)
-        except Exception as exc:
-            self._log.error("加入直播间失败: %s", exc)
-            self._emit_state("进房失败")
-            return
-        self._bridge = bridge
+        async with self._bridge_lock:
+            if self._bridge is not None and self._bridge.is_connected:
+                return
+            if self._bridge is not None:
+                await self._bridge.close()
+                self._bridge = None
+
+            def _on_disconnect(exc: BaseException) -> None:
+                self._bridge_failed.set()
+                self._log.warning("Bridge 已失效: %s", exc)
+
+            bridge = BridgeSession(
+                self.cookies,
+                self._current.user_id,
+                on_disconnect=_on_disconnect,
+            )
+            try:
+                await bridge.connect(self._session)
+            except Exception as exc:
+                await bridge.close()
+                self._log.error("加入直播间失败: %s", exc)
+                self._emit_state("进房失败")
+                return
+            self._bridge = bridge
+            self._bridge_failed.clear()
         self._log.info(
             "bridge 已连接 → %s broadNo=%s center=%s:%s",
             self._current.user_id,
@@ -467,19 +509,34 @@ class SoopMiner:
 
     async def _try_claim(self) -> None:
         assert self._drops
+        if not self._app_config.auto_claim_enabled:
+            await self._refresh_inventory()
+            return
         items = await self._drops.get_inventory(with_codes=False)
-        claimable = [it for it in items if it.can_claim]
+        claimable = [
+            it for it in items if it.can_claim and it.item_code_idx not in self._claimed_or_attempted
+        ]
         for item in claimable:
+            self._claimed_or_attempted.add(item.item_code_idx)
             try:
-                result = await self._drops.claim_item(item.item_code_idx)
-                code = result.get("itemCode") if isinstance(result, dict) else None
-                if code:
-                    self._log.info("已领取: %s  兑换码: %s", item.item_name, code)
+                result = await self._drops.claim_and_verify(item.item_code_idx, max_attempts=2)
+                if result.status == ClaimStatus.CLAIMED:
+                    masked = self._mask_code(result.redeem_code) if result.redeem_code else None
+                    if masked:
+                        self._log.info("已验证领取: %s  兑换码: %s", item.item_name, masked)
+                    else:
+                        self._log.info("已验证领取: %s", item.item_name)
                 else:
-                    self._log.info("已领取: %s", item.item_name)
+                    self._log.warning("领取接口未确认 %s: %s", item.item_name, result.message)
             except Exception as exc:
                 self._log.error("领取失败 %s: %s", item.item_name, exc)
         await self._refresh_inventory()
+
+    @staticmethod
+    def _mask_code(code: str) -> str:
+        if len(code) <= 6:
+            return "*" * len(code)
+        return f"{code[:3]}{'*' * (len(code) - 6)}{code[-3:]}"
 
     async def _heartbeat_loop(self) -> None:
         tick = 0
@@ -488,20 +545,25 @@ class SoopMiner:
                 try:
                     await self._ensure_session()
                     assert self._session
-                    if self._bridge is None:
+                    if self._bridge is None or not self._bridge.is_connected:
                         await self._ensure_bridge()
+                    if self._bridge is None or not self._bridge.is_connected:
+                        raise ConnectionError("Bridge 未连接")
                     ok = await self._heartbeat.send(self._session)
                     if ok:
                         self._heartbeat_fail_streak = 0
                     else:
                         self._heartbeat_fail_streak += 1
                         self._log.warning("心跳发送失败")
+                        if self._heartbeat_fail_streak >= 3:
+                            await self._recover_network("连续心跳失败")
                 except asyncio.CancelledError:
                     raise
                 except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                     self._heartbeat_fail_streak += 1
                     self._log.warning("心跳网络异常: %s", exc)
-                    await self._recover_network("心跳")
+                    if self._heartbeat_fail_streak >= 3:
+                        await self._recover_network("连续心跳网络异常")
                 except RuntimeError as exc:
                     if self._is_session_closed_error(exc):
                         await self._recover_network("心跳")
@@ -510,6 +572,8 @@ class SoopMiner:
                 except Exception as exc:
                     self._heartbeat_fail_streak += 1
                     self._log.warning("心跳异常: %s", exc)
+                    if self._heartbeat_fail_streak >= 3:
+                        await self._recover_network("连续心跳异常")
                 tick += 1
                 if tick % 6 == 0 and self._heartbeat_fail_streak == 0:
                     self._log.debug("心跳 OK → %s", self._current.user_id)
@@ -523,11 +587,13 @@ class SoopMiner:
     async def _poll_loop(self) -> None:
         mission_due = 0.0
         inventory_due = 0.0
+        channel_due = 0.0
+        stats_due = 0.0
         while not self._stop.is_set():
             now = asyncio.get_event_loop().time()
             if now >= mission_due:
                 try:
-                    await self._refresh_missions()
+                    await self._fetch_missions()
                 except asyncio.CancelledError:
                     raise
                 except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
@@ -540,7 +606,14 @@ class SoopMiner:
                         self._log.error("刷新任务失败: %s", exc)
                 except Exception as exc:
                     self._log.error("刷新任务失败: %s", exc)
-                mission_due = now + MISSION_POLL_INTERVAL
+                mission_due = now + self._app_config.effective_mission_poll_interval
+
+            if now >= channel_due:
+                try:
+                    await self._sync_channel()
+                except Exception as exc:
+                    self._log.warning("刷新直播间失败: %s", exc)
+                channel_due = now + self._app_config.effective_channel_refresh_interval
 
             if now >= inventory_due:
                 try:
@@ -557,7 +630,22 @@ class SoopMiner:
                         self._log.error("检查背包失败: %s", exc)
                 except Exception as exc:
                     self._log.error("检查背包失败: %s", exc)
-                inventory_due = now + INVENTORY_POLL_INTERVAL
+                inventory_due = now + self._app_config.effective_inventory_poll_interval
+
+            if now >= stats_due:
+                bps = self._network.stats.last_minute_bps
+                if bps >= 1_000_000:
+                    details = sorted(
+                        self._network.stats.by_type.items(),
+                        key=lambda pair: pair[1].uploaded + pair[1].downloaded,
+                        reverse=True,
+                    )
+                    culprit = ", ".join(
+                        f"{name}={(bucket.uploaded + bucket.downloaded) / 1024:.1f} KiB"
+                        for name, bucket in details[:3]
+                    )
+                    self._log.warning("估算流量异常偏高: %.2f Mbps；累计分类: %s", bps / 1_000_000, culprit)
+                stats_due = now + 60.0
 
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=5.0)
@@ -588,7 +676,7 @@ class SoopMiner:
             "开始挂机 → %s (心跳 %.0fs · 任务刷新 %.0fs)",
             self._current.user_id,
             HEARTBEAT_INTERVAL,
-            MISSION_POLL_INTERVAL,
+            self._app_config.effective_mission_poll_interval,
         )
         try:
             await self._refresh_inventory()
@@ -611,14 +699,15 @@ class SoopMiner:
 async def run_miner(*, userid: str | None = None, password: str | None = None) -> None:
     from .multi_miner import MultiMinerManager
 
+    app_config = load_settings()
     cookies_map = load_all_cookies()
     if userid and password:
-        cookies_map[userid] = await login(userid, password)
+        cookies_map[userid] = await login(userid, password, config=app_config)
     elif not cookies_map:
-        raise SystemExit("请先登录: python -m soop_miner --userid 账号 --password 密码")
+        raise SystemExit('请先登录: python "entry.py" --cli --userid 账号 --password 密码')
 
     loop = asyncio.get_running_loop()
-    manager = MultiMinerManager()
+    manager = MultiMinerManager(app_config=app_config)
 
     def _handle_stop() -> None:
         logger.info("正在停止...")

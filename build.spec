@@ -1,31 +1,42 @@
 # -*- mode: python ; coding: utf-8 -*-
-# 在项目根目录执行: pyinstaller soop_miner/build.spec --noconfirm
+# 在当前仓库根目录执行: pyinstaller build.spec --noconfirm --clean
 
-import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files
 
-ROOT = Path(SPECPATH).resolve().parent
+ROOT = Path(SPECPATH).resolve()
+SOURCE_NAMES = [
+    "__init__.py",
+    "__main__.py",
+    "auth.py",
+    "center.py",
+    "channel.py",
+    "config.py",
+    "constants.py",
+    "drops.py",
+    "gui.py",
+    "ui_components.py",
+    "ui_state.py",
+    "ui_theme.py",
+    "miner.py",
+    "models.py",
+    "modern_gui.py",
+    "multi_miner.py",
+    "network.py",
+    "settings_dialog.py",
+    "single_instance.py",
+    "stream.py",
+    "systray.py",
+    "watch.py",
+    "windows_startup.py",
+]
 
 a = Analysis(
-    [str(ROOT / "soop_miner" / "entry.py")],
+    [str(ROOT / "entry.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[],
+    datas=[(str(ROOT / name), ".") for name in SOURCE_NAMES] + collect_data_files("customtkinter"),
     hiddenimports=[
-        "soop_miner",
-        "soop_miner.__main__",
-        "soop_miner.gui",
-        "soop_miner.miner",
-        "soop_miner.multi_miner",
-        "soop_miner.channel",
-        "soop_miner.auth",
-        "soop_miner.drops",
-        "soop_miner.center",
-        "soop_miner.watch",
-        "soop_miner.models",
-        "soop_miner.constants",
-        "soop_miner.single_instance",
-        "soop_miner.systray",
         "aiohttp",
         "aiohttp.web",
         "multidict",
@@ -34,39 +45,33 @@ a = Analysis(
         "aiosignal",
         "attrs",
         "idna",
-        "websockets",
-        "websockets.legacy",
-        "websockets.legacy.client",
-        "websockets.legacy.protocol",
-        "websockets.asyncio",
-        "websockets.asyncio.client",
+        "tkinter",
+        "tkinter.messagebox",
+        "tkinter.scrolledtext",
+        "tkinter.ttk",
+        "customtkinter",
+        "_tkinter",
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["cookies"],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=None,
+    excludes=[],
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=None)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
-    a.zipfiles,
     a.datas,
     [],
-    name="SOOP_Drops_Miner",
+    name="CloudLight_SOOP_Drops_Miner",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,

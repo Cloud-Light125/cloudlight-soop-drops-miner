@@ -1,6 +1,6 @@
-# SOOP Drops Miner — 项目文档
+﻿# CloudLight SOOP Drops Miner — 项目文档
 
-> 版本：v1.0.1 · by www5329  
+> 版本：1.0 · by cloudlight
 > 本文档描述项目架构、模块职责、数据流与实现细节，供开发者阅读与维护。  
 > 用户使用说明见 [README.md](../README.md)。
 
@@ -32,7 +32,9 @@
 
 ## 1. 项目概述
 
-**SOOP Drops Miner** 是针对 [SOOP Live](https://www.sooplive.com)（原 AfreecaTV 国际版）掉宝（Drops）活动的第三方挂机工具。
+**CloudLight SOOP Drops Miner** 是针对 [SOOP Live](https://www.sooplive.com)（原 AfreecaTV 国际版）掉宝（Drops）活动的第三方挂机工具。
+
+公开仓库：[https://github.com/yundan125/cloudlight-soop-drops-miner](https://github.com/yundan125/cloudlight-soop-drops-miner)
 
 ### 设计目标
 
@@ -48,15 +50,14 @@
 |------|------|
 | 语言 | Python 3.10+ |
 | 异步 HTTP | aiohttp |
-| WebSocket | websockets |
-| GUI | tkinter（标准库） |
+| WebSocket | aiohttp `ws_connect` |
+| GUI | CustomTkinter 5.2.2（基于 Tkinter） |
 | 打包 | PyInstaller（单文件 exe） |
 
 ### 依赖
 
 ```
 aiohttp>=3.9.0
-websockets>=12.0
 yarl>=1.9.0
 ```
 
@@ -66,10 +67,10 @@ yarl>=1.9.0
 
 本仓库根目录 `TwitchDropsMiner-master` 源自开源项目 [Twitch Drops Miner](https://github.com/DevilXD/TwitchDropsMiner)（Twitch 掉宝挂机）。
 
-`soop_miner/` 是**独立子项目**，面向 SOOP Live 平台：
+`仓库根目录` 是**独立子项目**，面向 SOOP Live 平台：
 
 - 拥有独立的模块、API 对接与 GUI，**不依赖** Twitch 相关代码运行。
-- 可单独开源、单独打包为 `SOOP_Drops_Miner.exe`。
+- 可单独开源、单独打包为 `CloudLight_SOOP_Drops_Miner.exe`。
 - 上级目录 `soop_tools/` 为本地逆向/抓包辅助脚本，**不纳入 Git 仓库**，不参与运行时。
 
 ---
@@ -101,11 +102,11 @@ yarl>=1.9.0
 
 | 线程 | 职责 |
 |------|------|
-| **主线程** | Tkinter 事件循环，UI 渲染与用户交互 |
+| **主线程** | Tkinter 事件循环，CustomTkinter UI 渲染与用户交互 |
 | **Miner 线程** | 独立 `asyncio` 事件循环，运行 `MultiMinerManager` 与所有 `SoopMiner` |
 | **GUI 后台线程** | 添加账号、拉取背包、刷新直播间列表、智能选台预览等短时异步任务 |
 
-GUI 通过 `root.after(0, ...)` 将 `MinerState` 回调切回主线程更新界面，避免跨线程直接操作 Tk 组件。
+后台回调只向 `LatestStateMailbox` / `CallbackMailbox` 提交普通 Python 数据；主线程以 300ms 批次消费，并按 UID 合并同一账号的连续快照。日志进入线程安全队列后以 150ms 批量追加，避免跨线程直接操作 Tk 组件。
 
 ### 3.3 端到端数据流
 
@@ -137,7 +138,7 @@ _poll_loop (60s 任务 / 120s 背包)
        └─► 自动 claim_item + 背包同步
        │
        ▼
-MinerState ──on_state──► GUI 账号树 / 单类型进度面板 / 日志
+MinerState ──on_state──► 合并邮箱 ──► 稳定账号行 / 任务卡片 / 背包行
 ```
 
 ---
@@ -145,7 +146,7 @@ MinerState ──on_state──► GUI 账号树 / 单类型进度面板 / 日�
 ## 4. 目录结构
 
 ```
-soop_miner/
+repository-root/
 ├── entry.py              # PyInstaller 与开发统一入口
 ├── __main__.py           # CLI/GUI 参数路由
 ├── __init__.py
@@ -160,6 +161,10 @@ soop_miner/
 ├── miner.py              # 单账号挂机核心
 ├── multi_miner.py        # 多账号管理器
 ├── gui.py                # 图形界面
+├── modern_gui.py         # CustomTkinter 单页面主窗口
+├── ui_components.py      # 稳定行、任务卡与平滑进度条
+├── ui_state.py           # 纯数据 UI 快照、diff 与合并邮箱
+├── ui_theme.py           # 颜色、字体、圆角与尺寸
 ├── single_instance.py    # Windows 单实例
 ├── requirements.txt
 ├── README.md             # 用户使用说明
@@ -178,14 +183,14 @@ soop_miner/
 └── .disclaimer_accepted  # 首次免责确认（.gitignore）
 
 上级目录（开发/打包时，多数不在 Git 仓库内）：
-├── dist/SOOP_Drops_Miner.exe   # .gitignore
+├── dist/CloudLight_SOOP_Drops_Miner.exe   # .gitignore
 ├── build/                      # .gitignore
 └── soop_tools/                 # 开发辅助脚本，本地保留，勿提交
 ```
 
 ### 4.1 版本控制与隐私边界
 
-开源仓库**只跟踪** `soop_miner/` 内的正式源码、文档与打包配置。以下内容必须在 `.gitignore` 中排除，且不得 push：
+开源仓库**只跟踪** `仓库根目录` 内的正式源码、文档与打包配置。以下内容必须在 `.gitignore` 中排除，且不得 push：
 
 | 类别 | 路径示例 | 说明 |
 |------|----------|------|
@@ -203,7 +208,7 @@ soop_miner/
 
 ### 5.1 `entry.py`
 
-打包 exe 与 `python -m soop_miner` 的共用入口。无命令行参数时自动追加 `--gui`，再调用 `__main__.main()`。
+打包 exe 与 `python entry.py` 的共用入口。无命令行参数时自动追加 `--gui`，再调用 `__main__.main()`。
 
 ### 5.2 `__main__.py`
 
@@ -223,7 +228,7 @@ soop_miner/
 `DATA_DIR` 规则：
 
 - **打包后**：exe 所在目录
-- **源码运行**：`soop_miner/` 目录
+- **源码运行**：`仓库根目录` 目录
 
 关键 URL：`DROPS_MISSION_URL`（/mission）、`DROPS_EVENT_URL`（/event）。
 
@@ -647,40 +652,34 @@ CLI 模式（`run_miner()`）同样通过 `MultiMinerManager` 启动 `load_all_c
 
 ### 12.1 窗口与布局
 
-- 默认尺寸：**1080 × 920**，最小 **960 × 760**
-- 顶部：应用名 + 版本 + 账号统计
-- 底部：免责说明按钮 + `by www5329` + 版本
-- Notebook 两页：**多账号挂机** / **奖励背包**
+- 默认尺寸：**1320 × 900**，最小 **1180 × 760**
+- 顶部：应用名、版本、`by cloudlight`、运行/代理/Bridge/心跳/流量状态与全局操作
+- 全部主要功能位于一个 `CTkScrollableFrame` 单页面，不再使用主功能 Notebook
+- 奖励背包、设置、日志为可折叠卡片；折叠只隐藏内部容器，不销毁控件
 
-### 12.2 「多账号挂机」页结构
+### 12.2 单页面结构
 
 | 区域 | 内容 |
 |------|------|
 | 操作条 | 大号「全部开始」「全部停止」+ 状态提示 |
-| 账号列表 | 添加/删除、Treeview（状态/进度/直播间） |
+| 账号列表 | 按 UID 注册的稳定 `AccountRow`，增量新增/修改/删除 |
 | 直播间 | `ONE_STREAM_NOTICE` 说明；智能 / 手动 / 仅 owesports；优先任务 + 预计进入预览；手动列表与链接 |
-| 任务进度 | `PanedWindow` 上为**单类型**进度列，下为日志 |
-| 日志 | `ScrolledText`，挂载 `SoopDropsMiner` logger |
+| 任务进度 | 按 `UID + drops_idx` 注册任务卡，档位按 `itemCodeIdx` 稳定复用 |
+| 奖励背包 | 按 `UID + itemCodeIdx` 注册稳定行，兑换码掩码显示 |
+| 设置 | 统一配置服务、代理测试、开机启动与主题预览 |
+| 日志 | 一个长期存在的 `CTkTextbox`，队列批量追加并限制 4000 行 |
 
-挂机运行中，直播间列表每 **2 分钟**自动静默刷新（`_schedule_running_channel_refresh`）。
+频道刷新使用配置的 `channel_refresh_interval`；窗口隐藏且低流量模式开启时暂停非必要刷新。
 
-### 12.3 进度面板逻辑
+### 12.3 增量进度逻辑
 
-```python
-_effective_channel_for_progress()
-  → 挂机中：MinerState 当前频道
-  → 智能：_smart_preview_channel（异步 pick_channel 结果）
-  → 手动：_local_manual_channel()
-  → owesports：cached 中的 owesports
-
-missions_for_channel() → 过滤出当前类型 → 渲染 mission 块
-```
+`MissionUiState` / `TierUiState` 是不可变快照。普通刷新只比较字段并调用必要的 `configure()` / `set()`；新任务只创建对应卡片，消失任务只删除对应卡片。`SmoothProgressBar` 复用同一控件，以主线程 `after()` 在约 220ms 内平滑更新；新进度会取消旧动画，隐藏到托盘时直接对齐真实值。
 
 ### 12.4 线程与异步边界
 
-- **禁止**在 Miner 线程直接操作 Tk
-- 所有 UI 更新经 `root.after(0, callback)` 派发到主线程
-- 短时网络请求在独立 daemon 线程跑临时 `asyncio` 循环
+- **禁止**在 Miner、托盘与网络线程直接操作 Tk/CustomTkinter
+- 后台线程只写合并邮箱或回调队列，主线程定时批量处理
+- 短时网络请求在独立 daemon 线程跑临时 `asyncio` 循环，完成后将纯数据提交给主线程
 
 ### 12.5 首次运行
 
@@ -743,17 +742,17 @@ missions_for_channel() → 过滤出当前类型 → 渲染 mission 块
 ### 15.1 开发环境
 
 ```bat
-# 在 soop_miner 目录
+# 在仓库根目录
 run.bat
 
-# 或在上级目录
-python -m soop_miner --gui
+# 或直接调用真实入口
+python entry.py --gui
 ```
 
 ### 15.2 命令行模式
 
 ```bat
-python -m soop_miner --cli --userid 账号 --password 密码 -v
+python entry.py --cli --userid 账号 --password 密码 -v
 ```
 
 将加载已保存的全部账号并并行挂机；若提供 `--userid/--password` 会先登录并保存。
@@ -761,9 +760,9 @@ python -m soop_miner --cli --userid 账号 --password 密码 -v
 ### 15.3 打包 exe
 
 ```bat
-cd soop_miner
+cd "cloudlight soop drops miner"
 build.bat
-# 输出: ../dist/SOOP_Drops_Miner.exe
+# 输出: dist/CloudLight_SOOP_Drops_Miner.exe
 ```
 
 exe 无控制台窗口（`console=False`），默认启动 GUI。
@@ -776,10 +775,10 @@ exe 无控制台窗口（`console=False`），默认启动 GUI。
 
 ### 16.1 `build.spec` 要点
 
-- 入口：`soop_miner/entry.py`
-- 工作路径：上级仓库根目录（`pathex`）
+- 入口：`entry.py`
+- 工作路径：当前仓库根目录（`pathex`）
 - 单文件模式，`excludes=["cookies"]`
-- 显式 `hiddenimports` 包含 aiohttp、websockets 子模块
+- 显式 `hiddenimports` 包含 aiohttp 与 tkinter 所需子模块
 
 ### 16.2 发布检查清单
 
@@ -796,7 +795,7 @@ exe 无控制台窗口（`console=False`），默认启动 GUI。
 
 上级目录 `soop_tools/` 为**开发者本地工具链**，用于 API 发现与逻辑验证：
 
-- **不参与** `soop_miner` 运行时
+- **不参与**本仓库运行时
 - **不提交** 到开源仓库（已在 `.gitignore` 中忽略；与主仓库同级时请勿 `git add`）
 - 输出目录（如 `soop_capture_output/`、`*_probe/`）常含 Cookie 或原始 API 响应，同样不得入库
 
