@@ -46,7 +46,7 @@ from .multi_miner import MultiMinerManager
 from .network import AccountNetworkContext, ProxyTestResult, test_proxy_connectivity
 from .single_instance import release_single_instance
 from .systray import TrayMenuState, WinSystray, consume_show_request, create_systray
-from .ui_components import AccountRow, CollapsibleCard, InventoryRow, MissionCard, ToolTip
+from .ui_components import AccountRow, InventoryRow, MissionCard, ToolTip
 from .ui_state import (
     BoundedLogBuffer,
     CallbackMailbox,
@@ -89,7 +89,7 @@ class _QueuedLogHandler(logging.Handler):
 
 
 class ModernSoopGui:
-    """CustomTkinter single-page shell around the existing backend services."""
+    """CustomTkinter multi-page shell around the existing backend services."""
 
     def __init__(self, *, settings: AppConfig | None = None, start_hidden_to_tray: bool = False) -> None:
         self._app_config = snapshot_settings(settings or load_settings())
@@ -139,9 +139,16 @@ class ModernSoopGui:
         self._inventory_loading = False
         self._proxy_testing = False
         self._tray: WinSystray | None = None
-        self._about_window: ctk.CTkToplevel | None = None
         self._settings_dirty = False
         self._settings_baseline = snapshot_settings(self._app_config)
+        self._pages: dict[str, ctk.CTkFrame] = {}
+        self._nav_buttons: dict[str, ctk.CTkButton] = {}
+        self._current_page = "home"
+        self._channel_mode_value = "smart"
+        self._channel_priority_value = "自动选择优先任务"
+        self._channel_manual_value = ""
+        self._account_starting_uids: set[str] = set()
+        self._account_stopping_uids: set[str] = set()
 
         self._build_ui()
         self._setup_logging()
@@ -164,59 +171,222 @@ class ModernSoopGui:
 
     # ---------- construction ----------
     def _build_ui(self) -> None:
-        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=0)
+        self.root.grid_columnconfigure(1, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
-        self._page = ctk.CTkScrollableFrame(self.root, corner_radius=0, fg_color=COLORS["surface_alt"])
-        self._page.grid(row=0, column=0, sticky="nsew")
-        self._page.grid_columnconfigure(0, weight=1)
+        self._build_sidebar()
+        self._page_host = ctk.CTkFrame(self.root, corner_radius=0, fg_color=COLORS["surface_alt"])
+        self._page_host.grid(row=0, column=1, sticky="nsew")
+        self._page_host.grid_columnconfigure(0, weight=1)
+        self._page_host.grid_rowconfigure(0, weight=1)
+        self._show_page("home")
 
-        row = 0
-        self._header_card = ctk.CTkFrame(self._page, corner_radius=CARD_RADIUS, fg_color=COLORS["surface"])
-        self._header_card.grid(row=row, column=0, sticky="ew", padx=14, pady=(14, 6))
-        self._build_header(self._header_card)
-        row += 1
+    def _build_sidebar(self) -> None:
+        sidebar = ctk.CTkFrame(self.root, width=218, corner_radius=0, fg_color=COLORS["surface"])
+        sidebar.grid(row=0, column=0, sticky="nsew")
+        sidebar.grid_propagate(False)
+        sidebar.grid_columnconfigure(0, weight=1)
+        sidebar.grid_rowconfigure(10, weight=1)
+        ctk.CTkLabel(sidebar, text="CloudLight", font=font(20, "bold"), anchor="w").grid(
+            row=0, column=0, sticky="ew", padx=20, pady=(24, 2)
+        )
+        ctk.CTkLabel(
+            sidebar,
+            text="SOOP Drops Miner",
+            font=font(11),
+            text_color=COLORS["muted"],
+            anchor="w",
+        ).grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 20))
+        items = (
+            ("home", "首页"),
+            ("accounts", "账号管理"),
+            ("channels", "直播间"),
+            ("missions", "任务进度"),
+            ("inventory", "奖励背包"),
+            ("settings", "设置"),
+            ("logs", "运行日志"),
+            ("about", "关于"),
+        )
+        for row, (key, label) in enumerate(items, start=2):
+            button = ctk.CTkButton(
+                sidebar,
+                text=label,
+                command=lambda page=key: self._show_page(page),
+                height=42,
+                corner_radius=CONTROL_RADIUS,
+                anchor="w",
+                font=font(13, "bold"),
+                fg_color="transparent",
+                hover_color=COLORS["row_selected"],
+                text_color=("#344054", "#E4E7EC"),
+            )
+            button.grid(row=row, column=0, sticky="ew", padx=12, pady=3)
+            self._nav_buttons[key] = button
+        ctk.CTkLabel(
+            sidebar,
+            text=f"版本 {VERSION}\n{AUTHOR_BY}",
+            justify="left",
+            anchor="sw",
+            font=font(10),
+            text_color=COLORS["muted"],
+        ).grid(row=11, column=0, sticky="sw", padx=20, pady=18)
 
-        two = ctk.CTkFrame(self._page, fg_color="transparent")
-        two.grid(row=row, column=0, sticky="ew", padx=14, pady=6)
-        two.grid_columnconfigure(0, weight=3, uniform="main")
-        two.grid_columnconfigure(1, weight=2, uniform="main")
-        accounts = ctk.CTkFrame(two, corner_radius=CARD_RADIUS, fg_color=COLORS["surface"])
-        accounts.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        details = ctk.CTkFrame(two, corner_radius=CARD_RADIUS, fg_color=COLORS["surface"])
-        details.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+    def _new_page(self, key: str) -> ctk.CTkFrame:
+        page = ctk.CTkFrame(self._page_host, corner_radius=0, fg_color=COLORS["surface_alt"])
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(0, weight=1)
+        page.grid(row=0, column=0, sticky="nsew")
+        self._pages[key] = page
+        return page
+
+    def _show_page(self, key: str) -> None:
+        if self._quitting:
+            return
+        current = self._pages.get(self._current_page)
+        if current is not None and self._current_page != key:
+            self._capture_page_state(self._current_page)
+            current.grid_remove()
+        page = self._pages.get(key)
+        if page is None:
+            page = self._build_page(key)
+        page.grid()
+        page.tkraise()
+        self._current_page = key
+        for page_key, button in self._nav_buttons.items():
+            selected = page_key == key
+            button.configure(
+                fg_color=COLORS["accent"] if selected else "transparent",
+                hover_color=COLORS["accent_hover"] if selected else COLORS["row_selected"],
+                text_color="white" if selected else ("#344054", "#E4E7EC"),
+            )
+        self._sync_page(key)
+
+    def _capture_page_state(self, key: str) -> None:
+        if key == "channels" and "channels" in self._pages:
+            self._channel_mode_value = self._channel_mode.get()
+            self._channel_priority_value = self._priority_var.get()
+            self._channel_manual_value = self._manual_var.get()
+        elif key == "missions" and "missions" in self._pages:
+            for card in self._mission_cards.values():
+                card.stop_animations()
+
+    def _build_page(self, key: str) -> ctk.CTkFrame:
+        builders: dict[str, Callable[[ctk.CTkFrame], None]] = {
+            "home": self._build_home_page,
+            "accounts": self._build_accounts_page,
+            "channels": self._build_channels_page,
+            "missions": self._build_missions_page,
+            "inventory": self._build_inventory_page,
+            "settings": self._build_settings_page,
+            "logs": self._build_logs_page,
+            "about": self._build_about_page,
+        }
+        page = self._new_page(key)
+        builders[key](page)
+        return page
+
+    def _page_card(self, page: ctk.CTkFrame, *, scrollable: bool = False) -> ctk.CTkFrame:
+        card_type = ctk.CTkScrollableFrame if scrollable else ctk.CTkFrame
+        card = card_type(page, corner_radius=CARD_RADIUS, fg_color=COLORS["surface"])
+        card.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
+        card.grid_columnconfigure(0, weight=1)
+        return card
+
+    def _build_home_page(self, page: ctk.CTkFrame) -> None:
+        card = self._page_card(page)
+        card.grid_rowconfigure(0, weight=0)
+        self._header_card = card
+        self._build_header(card)
+
+    def _build_accounts_page(self, page: ctk.CTkFrame) -> None:
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(0, weight=3)
+        page.grid_rowconfigure(1, weight=2)
+        accounts = ctk.CTkFrame(page, corner_radius=CARD_RADIUS, fg_color=COLORS["surface"])
+        accounts.grid(row=0, column=0, sticky="nsew", padx=14, pady=(14, 6))
+        details = ctk.CTkFrame(page, corner_radius=CARD_RADIUS, fg_color=COLORS["surface"])
+        details.grid(row=1, column=0, sticky="nsew", padx=14, pady=(6, 14))
         self._build_accounts(accounts)
         self._build_details(details)
-        row += 1
 
-        channel = ctk.CTkFrame(self._page, corner_radius=CARD_RADIUS, fg_color=COLORS["surface"])
-        channel.grid(row=row, column=0, sticky="ew", padx=14, pady=6)
-        self._build_channel(channel)
-        row += 1
+    def _build_channels_page(self, page: ctk.CTkFrame) -> None:
+        card = self._page_card(page)
+        card.grid_rowconfigure(0, weight=0)
+        self._build_channel(card)
 
-        missions = ctk.CTkFrame(self._page, corner_radius=CARD_RADIUS, fg_color=COLORS["surface"])
-        missions.grid(row=row, column=0, sticky="ew", padx=14, pady=6)
-        self._build_missions(missions)
-        row += 1
+    def _build_missions_page(self, page: ctk.CTkFrame) -> None:
+        card = self._page_card(page)
+        self._build_missions(card)
 
-        self._inventory_card = CollapsibleCard(self._page, "奖励背包", expanded=True)
-        self._inventory_card.grid(row=row, column=0, sticky="ew", padx=14, pady=6)
-        self._build_inventory(self._inventory_card.body)
-        row += 1
+    def _build_inventory_page(self, page: ctk.CTkFrame) -> None:
+        card = self._page_card(page)
+        self._build_inventory(card)
 
-        self._settings_card = CollapsibleCard(self._page, "设置", expanded=False)
-        self._settings_card.grid(row=row, column=0, sticky="ew", padx=14, pady=6)
-        self._build_settings(self._settings_card.body)
-        row += 1
+    def _build_settings_page(self, page: ctk.CTkFrame) -> None:
+        card = self._page_card(page, scrollable=True)
+        self._build_settings(card)
 
-        self._log_card = CollapsibleCard(
-            self._page,
-            "运行日志",
-            expanded=True,
-            expanded_button_text="收起日志",
-            collapsed_button_text="查看日志",
-        )
-        self._log_card.grid(row=row, column=0, sticky="ew", padx=14, pady=(6, 14))
-        self._build_logs(self._log_card.body)
+    def _build_logs_page(self, page: ctk.CTkFrame) -> None:
+        card = self._page_card(page)
+        self._build_logs(card)
+
+    def _build_about_page(self, page: ctk.CTkFrame) -> None:
+        card = self._page_card(page)
+        card.grid_rowconfigure(0, weight=1)
+        content = ctk.CTkFrame(card, fg_color="transparent")
+        content.grid(row=0, column=0, sticky="nsew", padx=40, pady=40)
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_rowconfigure(0, weight=1)
+        inner = ctk.CTkFrame(content, corner_radius=CARD_RADIUS, fg_color=COLORS["row"])
+        inner.grid(row=0, column=0, sticky="nsew", padx=100, pady=40)
+        ctk.CTkLabel(inner, text=APP_NAME, font=font(25, "bold")).pack(pady=(48, 6))
+        ctk.CTkLabel(inner, text=f"版本 {VERSION}", font=font(13)).pack()
+        ctk.CTkLabel(
+            inner,
+            text=(
+                "用于管理 SOOP 掉宝任务的 Windows 桌面工具，\n"
+                "支持多账号、代理、低流量模式和任务进度查看。\n\n"
+                f"作者：{AUTHOR}\n\n"
+                f"项目主页：{GITHUB_REPOSITORY_URL or '仓库地址尚未配置'}\n"
+                f"开源许可证：{LICENSE_NAME}\n"
+                f"运行环境：Python {platform.python_version()}\n\n"
+                "本软件为第三方工具，与 SOOP、暴雪娱乐及相关赛事官方无隶属或合作关系。"
+            ),
+            justify="center",
+            wraplength=700,
+            text_color=COLORS["muted"],
+            font=font(12),
+        ).pack(fill="x", padx=36, pady=(24, 20))
+        actions = ctk.CTkFrame(inner, fg_color="transparent")
+        actions.pack(pady=(0, 42))
+        open_btn = self._button(actions, "打开 GitHub", lambda: webbrowser.open(GITHUB_REPOSITORY_URL), width=116, secondary=True)
+        open_btn.pack(side="left")
+        copy_btn = self._button(actions, "复制仓库地址", lambda: self._copy_to_clipboard(GITHUB_REPOSITORY_URL), width=132, secondary=True)
+        copy_btn.pack(side="left", padx=(8, 0))
+        if not GITHUB_REPOSITORY_URL:
+            open_btn.configure(state="disabled")
+            copy_btn.configure(state="disabled")
+
+    def _sync_page(self, key: str) -> None:
+        if key == "home":
+            self._refresh_header()
+        elif key == "accounts":
+            self._sync_account_rows()
+        elif key == "channels":
+            self._sync_channel_page()
+        elif key == "missions":
+            state = self._states.get(self._selected_uid or "")
+            if self._selected_uid:
+                self._render_missions_incremental(
+                    self._selected_uid,
+                    state.missions if state else [],
+                    (state.channel_nick or state.channel_id or "") if state else "",
+                )
+        elif key == "inventory":
+            self._set_inventory(self._all_inventory)
+        elif key == "logs":
+            self._update_log_accounts()
+            self._rebuild_log_view()
 
     def _build_header(self, host: ctk.CTkFrame) -> None:
         host.grid_columnconfigure(0, weight=1)
@@ -246,7 +416,6 @@ class ModernSoopGui:
         self._stop_btn.pack(side="left", padx=(8, 0))
         self._button(actions, "刷新状态", self._refresh_visible_data, width=104, secondary=True).pack(side="left", padx=(8, 0))
         self._button(actions, "隐藏到系统托盘", self._minimize_to_tray, width=140, secondary=True).pack(side="left", padx=(8, 0))
-        self._button(actions, "关于", self._show_about, width=82, secondary=True).pack(side="right")
 
     def _section_title(self, host: Any, title: str, subtitle: str = "") -> None:
         ctk.CTkLabel(host, text=title, font=font(16, "bold"), anchor="w").grid(row=0, column=0, sticky="w", padx=CARD_PAD, pady=(14, 0))
@@ -255,6 +424,7 @@ class ModernSoopGui:
 
     def _build_accounts(self, host: ctk.CTkFrame) -> None:
         host.grid_columnconfigure(0, weight=1)
+        host.grid_rowconfigure(5, weight=1)
         self._section_title(host, "账号管理", "添加 SOOP 账号后，可以分别选择直播间并开始累计掉宝进度。")
         form = ctk.CTkFrame(host, fg_color="transparent")
         form.grid(row=2, column=0, sticky="ew", padx=CARD_PAD, pady=(0, 8))
@@ -267,8 +437,14 @@ class ModernSoopGui:
         ctk.CTkEntry(form, textvariable=self._password_var, placeholder_text="请输入 SOOP 密码", show="●", corner_radius=CONTROL_RADIUS).grid(row=1, column=1, sticky="ew", padx=(5, 0))
         self._button(form, "添加账号", self._on_add_account, width=98).grid(row=1, column=2, padx=(10, 0))
         self._button(form, "删除账号", self._on_remove_account, width=98, secondary=True).grid(row=1, column=3, padx=(8, 0))
+        account_actions = ctk.CTkFrame(host, fg_color="transparent")
+        account_actions.grid(row=3, column=0, sticky="ew", padx=CARD_PAD, pady=(0, 8))
+        self._account_start_btn = self._button(account_actions, "启动当前账号", self._on_start_selected, width=126)
+        self._account_start_btn.pack(side="left")
+        self._account_stop_btn = self._button(account_actions, "停止当前账号", self._on_stop_selected, width=126, secondary=True)
+        self._account_stop_btn.pack(side="left", padx=(8, 0))
         headers = ctk.CTkFrame(host, fg_color="transparent")
-        headers.grid(row=3, column=0, sticky="ew", padx=CARD_PAD)
+        headers.grid(row=4, column=0, sticky="ew", padx=CARD_PAD)
         names = ("账号", "运行状态", "当前直播间", "当前任务", "掉宝进度", "直播连接", "观看状态", "当前流量")
         weights = (1, 1, 2, 2, 1, 1, 1, 1)
         for i, (name, weight) in enumerate(zip(names, weights)):
@@ -283,19 +459,21 @@ class ModernSoopGui:
             if help_text:
                 ToolTip(label, help_text)
         self._account_host = ctk.CTkScrollableFrame(host, height=190, fg_color="transparent")
-        self._account_host.grid(row=4, column=0, sticky="nsew", padx=CARD_PAD, pady=(5, CARD_PAD))
+        self._account_host.grid(row=5, column=0, sticky="nsew", padx=CARD_PAD, pady=(5, CARD_PAD))
         self._account_host.grid_columnconfigure(0, weight=1)
         self._account_empty = ctk.CTkLabel(self._account_host, text="还没有添加账号，请在上方输入账号和密码。", text_color=COLORS["muted"])
         self._account_empty.grid(row=0, column=0, pady=28)
 
     def _build_details(self, host: ctk.CTkFrame) -> None:
         host.grid_columnconfigure(0, weight=1)
+        host.grid_rowconfigure(2, weight=1)
         self._section_title(host, "当前账号状态", "选择左侧账号后，这里会显示当前直播间、掉宝任务、连接状态和流量信息。")
         self._detail_hint = ctk.CTkLabel(host, text="请先从左侧选择一个账号", text_color=COLORS["muted"], font=font(13))
         self._detail_hint.grid(row=2, column=0, pady=48)
         self._detail_grid = ctk.CTkFrame(host, fg_color="transparent")
         self._detail_grid.grid(row=2, column=0, sticky="nsew", padx=CARD_PAD, pady=(0, CARD_PAD))
         self._detail_grid.grid_columnconfigure(1, weight=1)
+        self._detail_grid.grid_columnconfigure(3, weight=1)
         self._detail_values: dict[str, ctk.CTkLabel] = {}
         rows = (
             ("账号", "uid"), ("运行状态", "status"), ("当前直播间", "channel"),
@@ -306,8 +484,10 @@ class ModernSoopGui:
             ("累计流量", "total"), ("主要流量来源", "source"),
         )
         for i, (caption, key) in enumerate(rows):
+            row_index = i % 7
+            column_offset = 0 if i < 7 else 2
             caption_label = ctk.CTkLabel(self._detail_grid, text=caption, text_color=COLORS["muted"], anchor="w", font=font(11))
-            caption_label.grid(row=i, column=0, sticky="nw", padx=(0, 12), pady=3)
+            caption_label.grid(row=row_index, column=column_offset, sticky="nw", padx=(0 if column_offset == 0 else 18, 12), pady=3)
             help_text = {
                 "直播连接": "显示账号与当前直播间的连接是否正常。",
                 "观看状态": "显示软件是否正在正常确认观看并累计掉宝时间。",
@@ -317,7 +497,7 @@ class ModernSoopGui:
             if help_text:
                 ToolTip(caption_label, help_text)
             label = ctk.CTkLabel(self._detail_grid, text="—", anchor="w", justify="left", wraplength=360, font=font(12))
-            label.grid(row=i, column=1, sticky="ew", pady=3)
+            label.grid(row=row_index, column=column_offset + 1, sticky="ew", pady=3)
             self._detail_values[key] = label
         self._detail_grid.grid_remove()
 
@@ -326,14 +506,14 @@ class ModernSoopGui:
         self._section_title(host, "直播间选择", ONE_STREAM_NOTICE)
         mode_row = ctk.CTkFrame(host, fg_color="transparent")
         mode_row.grid(row=2, column=0, sticky="ew", padx=CARD_PAD, pady=(0, 8))
-        self._channel_mode = ctk.StringVar(value="smart")
+        self._channel_mode = ctk.StringVar(value=self._channel_mode_value)
         self._mode_control = ctk.CTkSegmentedButton(
             mode_row,
             values=["自动选择", "手动选择", "仅守望先锋赛事频道"],
             command=self._on_mode_segment,
             corner_radius=CONTROL_RADIUS,
         )
-        self._mode_control.set("自动选择")
+        self._mode_control.set({"smart": "自动选择", "manual": "手动选择", "owesports": "仅守望先锋赛事频道"}[self._channel_mode_value])
         self._mode_control.pack(side="left")
         self._channel_refresh_btn = self._button(mode_row, "刷新直播间", self._fetch_channels_async, width=118, secondary=True)
         self._channel_refresh_btn.pack(side="right")
@@ -341,9 +521,9 @@ class ModernSoopGui:
         self._channel_body.grid(row=3, column=0, sticky="ew", padx=CARD_PAD, pady=(0, CARD_PAD))
         self._channel_body.grid_columnconfigure(1, weight=1)
         self._channel_field_label = ctk.CTkLabel(self._channel_body, text="优先任务", anchor="w")
-        self._priority_var = ctk.StringVar(value="自动选择优先任务")
-        self._priority = ctk.CTkComboBox(self._channel_body, variable=self._priority_var, values=["自动选择优先任务"], state="readonly", corner_radius=CONTROL_RADIUS)
-        self._manual_var = ctk.StringVar()
+        self._priority_var = ctk.StringVar(value=self._channel_priority_value)
+        self._priority = ctk.CTkComboBox(self._channel_body, variable=self._priority_var, values=[self._channel_priority_value], state="readonly", corner_radius=CONTROL_RADIUS)
+        self._manual_var = ctk.StringVar(value=self._channel_manual_value)
         self._manual_combo = ctk.CTkComboBox(self._channel_body, variable=self._manual_var, values=[""], corner_radius=CONTROL_RADIUS)
         self._channel_hint = ctk.CTkLabel(
             self._channel_body,
@@ -358,16 +538,23 @@ class ModernSoopGui:
 
     def _build_missions(self, host: ctk.CTkFrame) -> None:
         host.grid_columnconfigure(0, weight=1)
+        host.grid_rowconfigure(2, weight=1)
         self._section_title(host, "任务进度", "这里显示当前账号参加的掉宝任务、已观看时间、目标时长和奖励领取状态。")
-        self._mission_host = ctk.CTkFrame(host, fg_color="transparent")
-        self._mission_host.grid(row=2, column=0, sticky="ew", padx=CARD_PAD, pady=(0, CARD_PAD))
+        self._mission_host = ctk.CTkScrollableFrame(host, fg_color="transparent")
+        self._mission_host.grid(row=2, column=0, sticky="nsew", padx=CARD_PAD, pady=(0, CARD_PAD))
         self._mission_host.grid_columnconfigure(0, weight=1)
         self._mission_empty = ctk.CTkLabel(self._mission_host, text="请选择一个账号查看掉宝任务。", text_color=COLORS["muted"])
         self._mission_empty.grid(row=0, column=0, pady=26)
 
     def _build_inventory(self, host: ctk.CTkFrame) -> None:
+        host.grid_rowconfigure(5, weight=1)
+        self._section_title(
+            host,
+            "奖励背包",
+            "查看已获得的奖励、领取状态和兑换码，并可前往 SOOP 官方背包确认。",
+        )
         tools = ctk.CTkFrame(host, fg_color="transparent")
-        tools.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        tools.grid(row=2, column=0, sticky="ew", padx=CARD_PAD, pady=(0, 8))
         self._inventory_refresh_btn = self._button(tools, "刷新背包", self._fetch_inventory_async, width=104, secondary=True)
         self._inventory_refresh_btn.pack(side="left")
         self._button(tools, "领取选中", self._claim_selected, width=104, secondary=True).pack(side="left", padx=(8, 0))
@@ -382,14 +569,14 @@ class ModernSoopGui:
             justify="left",
             wraplength=1100,
             font=font(11),
-        ).grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        ).grid(row=3, column=0, sticky="ew", padx=CARD_PAD, pady=(0, 6))
         headers = ctk.CTkFrame(host, fg_color="transparent")
-        headers.grid(row=2, column=0, sticky="ew")
+        headers.grid(row=4, column=0, sticky="ew", padx=CARD_PAD)
         for i, name in enumerate(("账号", "奖励名称", "领取状态", "兑换码", "获得时间", "过期时间")):
             headers.grid_columnconfigure(i, weight=2 if i == 1 else 1)
             ctk.CTkLabel(headers, text=name, font=font(11, "bold"), text_color=COLORS["muted"], anchor="w").grid(row=0, column=i, sticky="ew", padx=5)
-        self._inventory_host = ctk.CTkFrame(host, fg_color="transparent")
-        self._inventory_host.grid(row=3, column=0, sticky="ew")
+        self._inventory_host = ctk.CTkScrollableFrame(host, fg_color="transparent")
+        self._inventory_host.grid(row=5, column=0, sticky="nsew", padx=CARD_PAD, pady=(4, CARD_PAD))
         self._inventory_host.grid_columnconfigure(0, weight=1)
         self._inventory_empty = ctk.CTkLabel(self._inventory_host, text="背包暂无数据", text_color=COLORS["muted"])
         self._inventory_empty.grid(row=0, column=0, pady=24)
@@ -403,15 +590,9 @@ class ModernSoopGui:
             "mission_poll_interval": ctk.StringVar(), "inventory_poll_interval": ctk.StringVar(), "channel_refresh_interval": ctk.StringVar(),
         }
         self._load_settings_vars(self._app_config)
-        ctk.CTkLabel(
-            host,
-            text="修改软件启动方式、代理、掉宝和刷新频率。",
-            text_color=COLORS["muted"],
-            anchor="w",
-            font=font(11),
-        ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self._section_title(host, "设置", "修改软件启动方式、代理、掉宝和刷新频率。")
         body = ctk.CTkFrame(host, fg_color="transparent")
-        body.grid(row=1, column=0, sticky="ew")
+        body.grid(row=2, column=0, sticky="ew", padx=CARD_PAD)
         body.grid_columnconfigure((0, 1, 2), weight=1, uniform="settings")
         general = self._settings_group(body, "常规设置", 0)
         self._switch(general, "开机后自动启动软件", "auto_start_enabled", command=self._on_auto_start_toggle).pack(anchor="w", pady=3)
@@ -506,9 +687,9 @@ class ModernSoopGui:
             font=font(10),
         ).pack(fill="x", pady=(5, 0))
         self._settings_status = ctk.CTkLabel(host, text="设置已保存。", text_color=COLORS["muted"], anchor="w")
-        self._settings_status.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self._settings_status.grid(row=3, column=0, sticky="w", padx=CARD_PAD, pady=(10, 0))
         actions = ctk.CTkFrame(host, fg_color="transparent")
-        actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        actions.grid(row=4, column=0, sticky="ew", padx=CARD_PAD, pady=(8, CARD_PAD))
         self._button(actions, "恢复默认设置", self._reset_settings_draft, width=128, secondary=True).pack(side="left")
         self._button(actions, "取消修改", self._cancel_settings_draft, width=104, secondary=True).pack(side="right", padx=(8, 0))
         self._button(actions, "保存设置", self._save_inline_settings, width=104).pack(side="right")
@@ -524,15 +705,10 @@ class ModernSoopGui:
         return content
 
     def _build_logs(self, host: ctk.CTkFrame) -> None:
-        ctk.CTkLabel(
-            host,
-            text="用于查看账号登录、直播连接、掉宝任务和错误信息。",
-            text_color=COLORS["muted"],
-            anchor="w",
-            font=font(11),
-        ).grid(row=0, column=0, sticky="ew", pady=(0, 7))
+        host.grid_rowconfigure(3, weight=1)
+        self._section_title(host, "运行日志", "用于查看账号登录、直播连接、掉宝任务和错误信息。")
         tools = ctk.CTkFrame(host, fg_color="transparent")
-        tools.grid(row=1, column=0, sticky="ew", pady=(0, 7))
+        tools.grid(row=2, column=0, sticky="ew", padx=CARD_PAD, pady=(0, 7))
         self._log_level_var = ctk.StringVar(value="全部级别")
         self._log_account_var = ctk.StringVar(value="全部账号")
         ctk.CTkComboBox(
@@ -549,8 +725,8 @@ class ModernSoopGui:
         ctk.CTkSwitch(tools, text="自动滚动", variable=self._log_autoscroll, font=font(11)).pack(side="left", padx=(12, 0))
         self._button(tools, "复制日志", self._copy_logs, width=92, secondary=True).pack(side="right")
         self._button(tools, "清空日志", self._clear_logs, width=92, secondary=True).pack(side="right", padx=(0, 8))
-        self._log_text = ctk.CTkTextbox(host, height=230, corner_radius=8, font=("Consolas", 11), wrap="word")
-        self._log_text.grid(row=2, column=0, sticky="ew")
+        self._log_text = ctk.CTkTextbox(host, corner_radius=8, font=("Consolas", 11), wrap="word")
+        self._log_text.grid(row=3, column=0, sticky="nsew", padx=CARD_PAD, pady=(0, CARD_PAD))
         self._log_text.insert("1.0", "暂时没有运行日志。")
         self._log_text.configure(state="disabled")
         self._log_placeholder_visible = True
@@ -573,7 +749,10 @@ class ModernSoopGui:
             return
         interval = 1000 if self._in_tray else 300
         self._state_poll_id = self.root.after(interval, self._drain_ui_mailboxes)
-        self._log_poll_id = self.root.after(500 if self._in_tray or not self._log_card.expanded else 150, self._drain_logs)
+        self._log_poll_id = self.root.after(150 if self._logs_visible() else 500, self._drain_logs)
+
+    def _logs_visible(self) -> bool:
+        return not self._in_tray and self._current_page == "logs" and "logs" in self._pages
 
     def _drain_ui_mailboxes(self) -> None:
         self._state_poll_id = None
@@ -619,7 +798,7 @@ class ModernSoopGui:
             if removed:
                 del self._visible_log_entries[:removed]
                 self._rebuild_log_view()
-            elif self._log_card.expanded:
+            elif self._logs_visible():
                 visible = [entry[2] for entry in batch if self._log_entry_visible(entry)]
                 if visible:
                     self._log_text.configure(state="normal")
@@ -630,7 +809,7 @@ class ModernSoopGui:
                     self._log_text.configure(state="disabled")
                     if self._log_autoscroll.get():
                         self._log_text.see("end")
-        interval = 500 if self._in_tray or not self._log_card.expanded else 150
+        interval = 150 if self._logs_visible() else 500
         self._log_poll_id = self.root.after(interval, self._drain_logs)
 
     def _log_entry_visible(self, entry: tuple[str, str, str]) -> bool:
@@ -647,6 +826,12 @@ class ModernSoopGui:
     def _rebuild_log_view(self) -> None:
         if not hasattr(self, "_log_text"):
             return
+        scroll_position = 1.0
+        if not self._log_autoscroll.get():
+            try:
+                scroll_position = self._log_text._textbox.yview()[0]
+            except Exception:
+                scroll_position = 0.0
         text = "\n".join(entry[2] for entry in self._visible_log_entries if self._log_entry_visible(entry))
         self._log_text.configure(state="normal")
         self._log_text.delete("1.0", "end")
@@ -659,10 +844,27 @@ class ModernSoopGui:
         self._log_text.configure(state="disabled")
         if self._log_autoscroll.get():
             self._log_text.see("end")
+        else:
+            try:
+                self._log_text._textbox.yview_moveto(scroll_position)
+            except Exception:
+                pass
 
     # ---------- incremental state ----------
     def _refresh_accounts_from_disk(self) -> None:
         uids = list_accounts()
+        if self._selected_uid not in uids:
+            self._selected_uid = uids[0] if uids else None
+        if "accounts" in self._pages:
+            self._sync_account_rows(uids)
+        if "logs" in self._pages:
+            self._update_log_accounts()
+        self._refresh_header()
+
+    def _sync_account_rows(self, uids: list[str] | None = None) -> None:
+        if "accounts" not in self._pages:
+            return
+        uids = list_accounts() if uids is None else uids
         for uid in tuple(self._account_rows):
             if uid not in uids:
                 self._account_rows.pop(uid).destroy()
@@ -687,20 +889,20 @@ class ModernSoopGui:
             self._selected_uid = None
             self._account_empty.grid()
             self._show_detail(None)
-        self._update_log_accounts()
-        self._refresh_header()
+        self._refresh_account_action_buttons()
 
     def _apply_state(self, state: MinerState) -> None:
         self._states[state.uid] = state
         ui = account_ui_state(state)
-        row = self._account_rows.get(state.uid)
-        if row is None:
-            row = AccountRow(self._account_host, ui, self._select_account)
-            row.grid(row=len(self._account_rows), column=0, sticky="ew", pady=(0, 5))
-            self._account_rows[state.uid] = row
-            self._account_empty.grid_remove()
-        else:
-            row.update_state(ui)
+        if "accounts" in self._pages:
+            row = self._account_rows.get(state.uid)
+            if row is None:
+                row = AccountRow(self._account_host, ui, self._select_account)
+                row.grid(row=len(self._account_rows), column=0, sticky="ew", pady=(0, 5))
+                self._account_rows[state.uid] = row
+                self._account_empty.grid_remove()
+            else:
+                row.update_state(ui)
         self._latest_account_ui[state.uid] = ui
         if state.inventory:
             existing = {(uid, item.item_code_idx): (uid, item) for uid, item in self._all_inventory}
@@ -709,8 +911,11 @@ class ModernSoopGui:
             self._set_inventory(list(existing.values()))
         if self._selected_uid == state.uid:
             self._cached_missions = list(state.missions)
-            self._show_detail(state)
-            self._render_missions_incremental(state.uid, state.missions, state.channel_nick or state.channel_id or "")
+            if "accounts" in self._pages:
+                self._show_detail(state)
+            if "missions" in self._pages:
+                self._render_missions_incremental(state.uid, state.missions, state.channel_nick or state.channel_id or "")
+        self._refresh_account_action_buttons()
         self._refresh_header()
 
     def _select_account(self, uid: str | None) -> None:
@@ -718,16 +923,21 @@ class ModernSoopGui:
             return
         previous = self._selected_uid
         self._selected_uid = uid
-        if previous in self._account_rows:
+        if "accounts" in self._pages and previous in self._account_rows:
             self._account_rows[previous].set_selected(False)
-        if uid in self._account_rows:
+        if "accounts" in self._pages and uid in self._account_rows:
             self._account_rows[uid].set_selected(True)
         state = self._states.get(uid, MinerState(uid=uid))
-        self._show_detail(state)
-        self._render_missions_incremental(uid, state.missions, state.channel_nick or state.channel_id or "")
+        if "accounts" in self._pages:
+            self._show_detail(state)
+        if "missions" in self._pages:
+            self._render_missions_incremental(uid, state.missions, state.channel_nick or state.channel_id or "")
+        self._refresh_account_action_buttons()
         self._refresh_header()
 
     def _show_detail(self, state: MinerState | None) -> None:
+        if "accounts" not in self._pages:
+            return
         if state is None:
             self._detail_grid.grid_remove()
             self._detail_hint.grid()
@@ -775,6 +985,9 @@ class ModernSoopGui:
 
     def _render_missions_incremental(self, uid: str, missions: list[Mission], channel: str) -> None:
         new = mission_ui_states(uid, missions, channel)
+        self._latest_mission_ui = {**{k: v for k, v in self._latest_mission_ui.items() if k[0] != uid}, **new}
+        if "missions" not in self._pages:
+            return
         visible_keys = set(new)
         for key, card in tuple(self._mission_cards.items()):
             if key[0] == uid and key not in visible_keys:
@@ -792,7 +1005,6 @@ class ModernSoopGui:
                 card.update_state(state)
                 if not card.winfo_ismapped():
                     card.grid()
-        self._latest_mission_ui = {**{k: v for k, v in self._latest_mission_ui.items() if k[0] != uid}, **new}
         if new:
             self._mission_empty.grid_remove()
         else:
@@ -809,6 +1021,9 @@ class ModernSoopGui:
     def _set_inventory(self, items: list[tuple[str, InventoryItem]]) -> None:
         self._all_inventory = list(items)
         new = inventory_ui_states(items)
+        self._latest_inventory_ui = new
+        if "inventory" not in self._pages:
+            return
         for key in tuple(self._inventory_rows):
             if key not in new:
                 self._inventory_rows.pop(key).destroy()
@@ -821,7 +1036,6 @@ class ModernSoopGui:
             else:
                 row.update_state(state)
             row.set_selected(key == self._selected_inventory_key)
-        self._latest_inventory_ui = new
         if new:
             self._inventory_empty.grid_remove()
         else:
@@ -830,17 +1044,20 @@ class ModernSoopGui:
     def _select_inventory(self, key: tuple[str, str]) -> None:
         old = self._selected_inventory_key
         self._selected_inventory_key = key
-        if old in self._inventory_rows:
+        if "inventory" in self._pages and old in self._inventory_rows:
             self._inventory_rows[old].set_selected(False)
-        if key in self._inventory_rows:
+        if "inventory" in self._pages and key in self._inventory_rows:
             self._inventory_rows[key].set_selected(True)
 
     # ---------- channels / network data ----------
     def _on_mode_segment(self, value: str) -> None:
-        self._channel_mode.set({"自动选择": "smart", "手动选择": "manual", "仅守望先锋赛事频道": "owesports"}[value])
+        self._channel_mode_value = {"自动选择": "smart", "手动选择": "manual", "仅守望先锋赛事频道": "owesports"}[value]
+        self._channel_mode.set(self._channel_mode_value)
         self._apply_channel_mode_ui()
 
     def _apply_channel_mode_ui(self) -> None:
+        if "channels" not in self._pages:
+            return
         for widget in (self._priority, self._manual_combo, self._channel_hint):
             widget.grid_remove()
         mode = self._channel_mode.get()
@@ -861,21 +1078,49 @@ class ModernSoopGui:
 
     def _get_channel_config(self) -> ChannelConfig:
         priority = PRIORITY_MISSION_AUTO
-        selected = self._priority_var.get()
+        if "channels" in self._pages:
+            self._channel_mode_value = self._channel_mode.get()
+            self._channel_priority_value = self._priority_var.get()
+            self._channel_manual_value = self._manual_var.get()
+        selected = self._channel_priority_value
         if selected and selected != "自动选择优先任务":
             priority = selected.split(" · ", 1)[0]
-        manual = self._manual_var.get().strip()
+        manual = self._channel_manual_value.strip()
         mapped = self._channel_map.get(manual)
         if mapped:
             manual = f"{mapped.user_id}/{mapped.broad_no or ''}".rstrip("/")
-        return ChannelConfig(mode=self._channel_mode.get(), manual_input=manual, preferred_bjid=DEFAULT_CHANNEL_BJID, priority_mission_id=priority)
+        return ChannelConfig(mode=self._channel_mode_value, manual_input=manual, preferred_bjid=DEFAULT_CHANNEL_BJID, priority_mission_id=priority)
+
+    def _sync_channel_page(self) -> None:
+        if "channels" not in self._pages:
+            return
+        if self._current_page == "channels":
+            self._channel_mode_value = self._channel_mode.get()
+            self._channel_priority_value = self._priority_var.get()
+            self._channel_manual_value = self._manual_var.get()
+        self._channel_mode.set(self._channel_mode_value)
+        self._mode_control.set({"smart": "自动选择", "manual": "手动选择", "owesports": "仅守望先锋赛事频道"}[self._channel_mode_value])
+        self._priority_var.set(self._channel_priority_value)
+        self._manual_var.set(self._channel_manual_value)
+        values: list[str] = []
+        self._channel_map.clear()
+        for channel in self._cached_channels:
+            label = format_channel_drops_label(channel)
+            values.append(label)
+            self._channel_map[label] = channel
+        self._manual_combo.configure(values=values or [""])
+        if values and not self._manual_var.get():
+            self._manual_var.set(values[0])
+            self._channel_manual_value = values[0]
+        self._apply_channel_mode_ui()
 
     def _fetch_channels_async(self, *, silent: bool = False) -> None:
         if self._channel_loading or (self._in_tray and self._app_config.low_bandwidth_mode):
             return
         self._channel_loading = True
-        self._channel_refresh_btn.configure(state="disabled", text="正在刷新……")
-        self._channel_hint.configure(text="正在获取直播间列表……")
+        if "channels" in self._pages:
+            self._channel_refresh_btn.configure(state="disabled", text="正在刷新……")
+            self._channel_hint.configure(text="正在获取直播间列表……")
         uids = list_accounts()
         config = snapshot_settings(self._app_config)
 
@@ -901,27 +1146,24 @@ class ModernSoopGui:
 
     def _finish_channels(self, channels: list[LiveChannel], error: BaseException | None, silent: bool) -> None:
         self._channel_loading = False
-        self._channel_refresh_btn.configure(state="normal", text="刷新直播间")
+        if "channels" in self._pages:
+            self._channel_refresh_btn.configure(state="normal", text="刷新直播间")
         if error:
             logger.warning("获取直播间失败：%s", error)
-            self._channel_hint.configure(text="获取直播间失败，请检查网络或代理设置。")
+            if "channels" in self._pages:
+                self._channel_hint.configure(text="获取直播间失败，请检查网络或代理设置。")
             if not silent:
                 messagebox.showerror("刷新直播间", "获取直播间失败，请检查网络或代理设置。", parent=self.root)
             return
         self._cached_channels = channels
-        values: list[str] = []
         self._channel_map.clear()
         for channel in channels:
             label = format_channel_drops_label(channel)
-            values.append(label)
             self._channel_map[label] = channel
-        self._manual_combo.configure(values=values or [""])
-        if values and not self._manual_var.get():
-            self._manual_var.set(values[0])
-        if not values:
-            self._channel_hint.configure(text="暂时没有找到可用直播间，请稍后刷新。")
-        else:
-            self._apply_channel_mode_ui()
+        if "channels" in self._pages:
+            self._sync_channel_page()
+            if not channels:
+                self._channel_hint.configure(text="暂时没有找到可用直播间，请稍后刷新。")
         self._append_log(f"频道列表已刷新：{len(channels)} 个")
         self._schedule_channel_refresh()
 
@@ -937,7 +1179,8 @@ class ModernSoopGui:
         if self._inventory_loading:
             return
         self._inventory_loading = True
-        self._inventory_refresh_btn.configure(state="disabled", text="刷新中…")
+        if "inventory" in self._pages:
+            self._inventory_refresh_btn.configure(state="disabled", text="刷新中…")
         uids = list_accounts()
         config = snapshot_settings(self._app_config)
 
@@ -965,7 +1208,8 @@ class ModernSoopGui:
 
     def _finish_inventory(self, items: list[tuple[str, InventoryItem]], error: BaseException | None) -> None:
         self._inventory_loading = False
-        self._inventory_refresh_btn.configure(state="normal", text="刷新背包")
+        if "inventory" in self._pages:
+            self._inventory_refresh_btn.configure(state="normal", text="刷新背包")
         if error:
             messagebox.showerror("刷新背包", str(error), parent=self.root)
             return
@@ -1025,21 +1269,28 @@ class ModernSoopGui:
     def _on_start_all(self) -> None:
         if self._quitting or self._starting or (self._thread and self._thread.is_alive()):
             return
-        if not list_accounts():
+        cookies_map = load_all_cookies()
+        if not cookies_map:
             messagebox.showinfo("开始全部账号", "请先添加至少一个账号。", parent=self.root)
             self._show_main_window()
+            return
+        self._start_cookie_map(cookies_map)
+
+    def _start_cookie_map(self, cookies_map: dict[str, dict[str, str]]) -> None:
+        if self._quitting or self._starting or (self._thread and self._thread.is_alive()):
             return
         self._starting = True
         self._stopping = False
         self._app_config = load_settings()
         settings = snapshot_settings(self._app_config)
         channel_config = self._get_channel_config()
+        self._refresh_account_action_buttons()
         self._refresh_header()
         def runner() -> None:
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
             try:
-                self._loop.run_until_complete(self._run_all(settings, channel_config))
+                self._loop.run_until_complete(self._run_accounts(settings, channel_config, cookies_map))
             except Exception:
                 logger.exception("多账号运行异常")
             finally:
@@ -1050,9 +1301,14 @@ class ModernSoopGui:
         self._thread = threading.Thread(target=runner, name="MultiMiner", daemon=True)
         self._thread.start()
 
-    async def _run_all(self, settings: AppConfig, channel_config: ChannelConfig) -> None:
+    async def _run_accounts(
+        self,
+        settings: AppConfig,
+        channel_config: ChannelConfig,
+        cookies_map: dict[str, dict[str, str]],
+    ) -> None:
         self._manager = MultiMinerManager(on_state=self._on_state, channel_config=channel_config, app_config=settings)
-        started = await self._manager.start_all(load_all_cookies())
+        started = await self._manager.start_all(cookies_map)
         self._schedule_ui(lambda: self._after_started(started))
         if started:
             await self._manager.wait()
@@ -1060,16 +1316,21 @@ class ModernSoopGui:
 
     def _after_started(self, started: list[str]) -> None:
         self._starting = False
+        self._account_starting_uids.clear()
         self._append_log(f"已启动 {len(started)} 个账号" if started else "没有账号成功启动")
+        self._refresh_account_action_buttons()
         self._refresh_header()
         self._schedule_channel_refresh()
 
     def _on_miners_stopped(self) -> None:
         self._starting = False
         self._stopping = False
+        self._account_starting_uids.clear()
+        self._account_stopping_uids.clear()
         for uid, state in list(self._states.items()):
             if state.running:
                 self._apply_state(MinerState(uid=uid, status="已停止"))
+        self._refresh_account_action_buttons()
         self._refresh_header()
 
     def _on_stop_all(self) -> None:
@@ -1080,7 +1341,98 @@ class ModernSoopGui:
             self._loop.call_soon_threadsafe(self._manager.stop_all)
         else:
             self._manager.stop_all()
+        self._refresh_account_action_buttons()
         self._refresh_header()
+
+    def _refresh_account_action_buttons(self) -> None:
+        if "accounts" not in self._pages or not hasattr(self, "_account_start_btn"):
+            return
+        uid = self._selected_uid
+        state = self._states.get(uid or "")
+        miner = self._manager.get_miner(uid) if uid and self._manager else None
+        running = bool((state and state.running) or (miner and miner.get_state().running))
+        busy = bool(
+            not uid
+            or self._starting
+            or self._stopping
+            or uid in self._account_starting_uids
+            or uid in self._account_stopping_uids
+        )
+        self._account_start_btn.configure(
+            state="disabled" if busy or running else "normal",
+            text="正在启动" if uid in self._account_starting_uids else "启动当前账号",
+        )
+        self._account_stop_btn.configure(
+            state="normal" if running and not busy else "disabled",
+            text="正在停止" if uid in self._account_stopping_uids else "停止当前账号",
+        )
+
+    def _on_start_selected(self) -> None:
+        uid = self._selected_uid
+        if not uid:
+            messagebox.showinfo("启动账号", "请先选择账号。", parent=self.root)
+            return
+        cookies = load_cookies(uid)
+        if not cookies:
+            messagebox.showerror("启动账号", "未找到该账号的本地登录信息，请重新添加账号。", parent=self.root)
+            return
+        if self._manager and self._loop and self._loop.is_running():
+            if self._manager.get_miner(uid) and self._manager.get_miner(uid).get_state().running:
+                return
+            self._account_starting_uids.add(uid)
+            self._refresh_account_action_buttons()
+            future = asyncio.run_coroutine_threadsafe(self._manager.start_account(cookies), self._loop)
+
+            def wait_worker() -> None:
+                try:
+                    future.result(timeout=40)
+                    self._schedule_ui(lambda: self._after_selected_started(uid, None))
+                except Exception as exc:
+                    self._schedule_ui(lambda exc=exc: self._after_selected_started(uid, exc))
+
+            threading.Thread(target=wait_worker, name="StartSelectedAccount", daemon=True).start()
+            return
+        self._account_starting_uids.add(uid)
+        self._refresh_account_action_buttons()
+        self._start_cookie_map({uid: cookies})
+
+    def _after_selected_started(self, uid: str, error: BaseException | None) -> None:
+        self._account_starting_uids.discard(uid)
+        if error:
+            logger.error("[%s] 启动失败：%s", uid, error)
+            messagebox.showerror("启动账号", "账号启动失败，请查看运行日志。", parent=self.root)
+        else:
+            self._append_log(f"[{uid}] 账号已启动", account=uid)
+        self._refresh_account_action_buttons()
+        self._refresh_header()
+
+    def _on_stop_selected(self) -> None:
+        uid = self._selected_uid
+        manager, loop = self._manager, self._loop
+        if not uid or not manager or not loop or not loop.is_running() or not manager.get_miner(uid):
+            return
+        self._account_stopping_uids.add(uid)
+        self._refresh_account_action_buttons()
+        future = asyncio.run_coroutine_threadsafe(manager.stop_account_and_wait(uid), loop)
+
+        def wait_worker() -> None:
+            try:
+                future.result(timeout=40)
+                self._schedule_ui(lambda: self._after_selected_stopped(uid, None))
+            except Exception as exc:
+                self._schedule_ui(lambda exc=exc: self._after_selected_stopped(uid, exc))
+
+        threading.Thread(target=wait_worker, name="StopSelectedAccount", daemon=True).start()
+
+    def _after_selected_stopped(self, uid: str, error: BaseException | None) -> None:
+        self._account_stopping_uids.discard(uid)
+        if error:
+            logger.error("[%s] 停止失败：%s", uid, error)
+            messagebox.showerror("停止账号", "账号停止失败，请查看运行日志。", parent=self.root)
+        else:
+            self._append_log(f"[{uid}] 账号已停止", account=uid)
+            self._apply_state(MinerState(uid=uid, status="已停止"))
+        self._refresh_account_action_buttons()
 
     def _refresh_visible_data(self) -> None:
         self._refresh_accounts_from_disk()
@@ -1431,59 +1783,7 @@ class ModernSoopGui:
             self._button(buttons, "关闭", window.destroy, width=90, secondary=True).pack(side="right", padx=(0, 8))
 
     def _show_about(self) -> None:
-        if self._about_window is not None:
-            try:
-                if self._about_window.winfo_exists():
-                    self._about_window.deiconify(); self._about_window.lift(); self._about_window.focus_force(); return
-            except Exception:
-                pass
-        window = ctk.CTkToplevel(self.root)
-        self._about_window = window
-        window.title(f"关于 {APP_NAME}")
-        window.geometry("620x540")
-        window.resizable(False, False)
-        window.transient(self.root)
-        card = ctk.CTkFrame(window, corner_radius=CARD_RADIUS)
-        card.pack(fill="both", expand=True, padx=18, pady=18)
-        ctk.CTkLabel(card, text=APP_NAME, font=font(22, "bold")).pack(pady=(24, 4))
-        ctk.CTkLabel(
-            card,
-            text=(
-                f"版本 {VERSION}\n\n"
-                "用于管理 SOOP 掉宝任务的 Windows 桌面工具，\n"
-                "支持多账号、代理、低流量模式和任务进度查看。\n\n"
-                f"作者：{AUTHOR}"
-            ),
-            justify="center",
-            font=font(13),
-        ).pack()
-        repo = GITHUB_REPOSITORY_URL or "仓库地址尚未配置"
-        ctk.CTkLabel(
-            card,
-            text=(
-                f"\n项目主页：{repo}\n"
-                f"开源许可证：{LICENSE_NAME}\n"
-                f"运行环境：Python {platform.python_version()}\n\n"
-                "本软件为第三方工具，与 SOOP、暴雪娱乐及相关赛事官方无隶属或合作关系。"
-            ),
-            justify="center",
-            wraplength=550,
-            text_color=COLORS["muted"],
-            font=font(11),
-        ).pack()
-        actions = ctk.CTkFrame(card, fg_color="transparent")
-        actions.pack(fill="x", side="bottom", padx=18, pady=18)
-        open_btn = self._button(actions, "打开 GitHub", lambda: webbrowser.open(GITHUB_REPOSITORY_URL), width=110, secondary=True)
-        open_btn.pack(side="left")
-        copy_btn = self._button(actions, "复制仓库地址", lambda: self._copy_to_clipboard(GITHUB_REPOSITORY_URL), width=126, secondary=True)
-        copy_btn.pack(side="left", padx=(8, 0))
-        if not GITHUB_REPOSITORY_URL:
-            open_btn.configure(state="disabled"); copy_btn.configure(state="disabled")
-        self._button(actions, "关闭", window.destroy, width=86).pack(side="right")
-        def closed() -> None:
-            self._about_window = None
-            window.destroy()
-        window.protocol("WM_DELETE_WINDOW", closed)
+        self._show_page("about")
 
     def _on_close(self) -> None:
         if self._app_config.close_to_tray:
@@ -1562,6 +1862,8 @@ class ModernSoopGui:
         self._copy_to_clipboard(self._log_text.get("1.0", "end-1c"))
 
     def _update_log_accounts(self) -> None:
+        if "logs" not in self._pages:
+            return
         values = ["全部账号", *list_accounts()]
         self._log_account_filter.configure(values=values)
         if self._log_account_var.get() not in values:
