@@ -34,8 +34,8 @@ class SettingsDialog:
         self._test_queue: queue.Queue[list[ProxyTestResult] | BaseException] = queue.Queue()
         self.window = tk.Toplevel(parent)
         self.window.title("设置")
-        self.window.geometry("620x690")
-        self.window.minsize(580, 620)
+        self.window.geometry("660x790")
+        self.window.minsize(620, 720)
         self.window.transient(parent)
         self.window.protocol("WM_DELETE_WINDOW", self._cancel)
 
@@ -59,11 +59,12 @@ class SettingsDialog:
         host = ttk.Frame(self.window, padding=12)
         host.pack(fill=tk.BOTH, expand=True)
 
-        general = ttk.LabelFrame(host, text="常规", padding=10)
+        ttk.Label(host, text="修改软件启动方式、代理、掉宝和刷新频率。").pack(fill=tk.X, pady=(0, 10))
+        general = ttk.LabelFrame(host, text="常规设置", padding=10)
         general.pack(fill=tk.X, pady=(0, 10))
         auto = ttk.Checkbutton(
             general,
-            text="开机自启（当前 Windows 用户）",
+            text="开机后自动启动软件",
             variable=self._auto_start,
             command=self._on_auto_start_toggle,
         )
@@ -72,18 +73,23 @@ class SettingsDialog:
             auto.configure(state=tk.DISABLED)
         ttk.Checkbutton(
             general,
-            text="启动后静默进入系统托盘",
+            text="启动后直接隐藏到系统托盘",
             variable=self._start_tray,
         ).pack(anchor=tk.W, pady=(4, 0))
         ttk.Checkbutton(
             general,
-            text="关闭主窗口时隐藏到托盘",
+            text="关闭主窗口时继续在托盘运行",
             variable=self._close_tray,
         ).pack(anchor=tk.W, pady=(4, 0))
+        ttk.Label(
+            general,
+            text="隐藏到托盘后，正在运行的掉宝任务不会停止。",
+            foreground="#757575",
+        ).pack(anchor=tk.W, pady=(6, 0))
 
         network = ttk.LabelFrame(host, text="网络", padding=10)
         network.pack(fill=tk.X, pady=(0, 10))
-        ttk.Checkbutton(network, text="启用代理", variable=self._proxy_enabled).grid(
+        ttk.Checkbutton(network, text="使用代理服务器", variable=self._proxy_enabled).grid(
             row=0, column=0, sticky=tk.W
         )
         ttk.Label(network, text="代理地址").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
@@ -95,60 +101,72 @@ class SettingsDialog:
         )
         ttk.Checkbutton(
             network,
-            text="代理失败后允许直连",
+            text="代理不可用时自动改用直连",
             variable=self._proxy_fallback,
         ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
-        self._test_button = ttk.Button(network, text="测试代理", command=self._test_proxy)
-        self._test_button.grid(row=4, column=0, sticky=tk.W, pady=(8, 0))
+        ttk.Label(
+            network,
+            text="关闭此选项后，代理连接失败时不会自动使用本机直连。",
+            foreground="#757575",
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        self._test_button = ttk.Button(network, text="测试代理连接", command=self._test_proxy)
+        self._test_button.grid(row=5, column=0, sticky=tk.W, pady=(8, 0))
         self._test_status = tk.StringVar(value="")
         ttk.Label(
             network,
             textvariable=self._test_status,
             justify=tk.LEFT,
             wraplength=520,
-        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        ).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
         ttk.Label(
             network,
-            text="新代理设置将在下次启动挂机或网络重连时生效。",
+            text="代理设置将在下次开始账号或网络重新连接时生效，不会中断当前正在运行的任务。",
             foreground="#ef6c00",
-        ).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+            wraplength=570,
+        ).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
         network.columnconfigure(1, weight=1)
 
         drops = ttk.LabelFrame(host, text="掉宝", padding=10)
         drops.pack(fill=tk.X, pady=(0, 10))
-        ttk.Checkbutton(drops, text="自动领取奖励", variable=self._auto_claim).grid(
+        ttk.Checkbutton(drops, text="完成任务后尝试自动领取奖励", variable=self._auto_claim).grid(
             row=0, column=0, columnspan=2, sticky=tk.W
         )
         ttk.Label(
             drops,
-            text="领取后会重新读取 Inventory 验证；无法确认时请在官方背包页手动领取。",
+            text="只有在奖励背包确认状态已经变化后，软件才会显示领取成功。无法确认时需要前往官方背包手动领取。",
             foreground="#757575",
             wraplength=530,
         ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(2, 6))
-        ttk.Checkbutton(drops, text="低流量模式", variable=self._low_bandwidth).grid(
+        ttk.Checkbutton(drops, text="低流量模式（推荐）", variable=self._low_bandwidth).grid(
             row=2, column=0, columnspan=2, sticky=tk.W
         )
+        ttk.Label(
+            drops,
+            text="只发送累计掉宝进度所需的请求，不加载直播视频内容。",
+            foreground="#757575",
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(2, 4))
         rows = (
-            ("Mission 刷新间隔（30～600 秒）", self._mission_interval),
-            ("背包刷新间隔（60～1800 秒）", self._inventory_interval),
-            ("频道列表刷新间隔（60～1800 秒）", self._channel_interval),
+            ("任务进度刷新间隔（秒，30～600）", self._mission_interval),
+            ("奖励背包刷新间隔（秒，60～1800）", self._inventory_interval),
+            ("直播间列表刷新间隔（秒，60～1800）", self._channel_interval),
         )
-        for row, (label, variable) in enumerate(rows, start=3):
+        for row, (label, variable) in enumerate(rows, start=4):
             ttk.Label(drops, text=label).grid(row=row, column=0, sticky=tk.W, pady=(6, 0))
             ttk.Entry(drops, textvariable=variable, width=10).grid(
                 row=row, column=1, sticky=tk.E, pady=(6, 0)
             )
         ttk.Label(
             drops,
-            text="观看心跳固定 5 秒；Bridge Keepalive 固定 20 秒。",
+            text="数值越小，状态更新越及时，但网络请求也会更频繁。一般保持默认值即可。",
             foreground="#757575",
-        ).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+            wraplength=570,
+        ).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
         drops.columnconfigure(0, weight=1)
 
         buttons = ttk.Frame(host)
         buttons.pack(fill=tk.X, side=tk.BOTTOM)
-        ttk.Button(buttons, text="恢复默认值", command=self._reset_draft).pack(side=tk.LEFT)
-        ttk.Button(buttons, text="保存", command=self._save).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="恢复默认设置", command=self._reset_draft).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="保存设置", command=self._save).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="取消", command=self._cancel).pack(side=tk.RIGHT, padx=(0, 8))
 
     def _load_vars(self, settings: AppConfig) -> None:
@@ -229,7 +247,7 @@ class SettingsDialog:
                     self._set_registry(previous.auto_start_enabled)
                 except Exception:
                     pass
-            messagebox.showerror("设置", f"保存失败，原设置未改变：{exc}", parent=self.window)
+            messagebox.showerror("设置", "设置保存失败，原设置未被修改。", parent=self.window)
             return
         self._current = saved
         self._baseline = replace(saved)
@@ -260,10 +278,11 @@ class SettingsDialog:
             if not draft.proxy_enabled:
                 raise ValueError("请先启用代理")
         except ValueError as exc:
-            messagebox.showerror("测试代理", str(exc), parent=self.window)
+            messagebox.showerror("测试代理连接", str(exc), parent=self.window)
             return
         self._test_button.configure(state=tk.DISABLED)
-        self._test_status.set("正在测试代理链路…")
+        self._test_button.configure(text="正在测试……")
+        self._test_status.set("正在测试登录服务、掉宝服务、直播服务和直播连接……")
 
         def worker() -> None:
             try:
@@ -281,17 +300,24 @@ class SettingsDialog:
             if self.window.winfo_exists():
                 self.window.after(100, self._poll_proxy_test)
             return
-        self._test_button.configure(state=tk.NORMAL)
+        self._test_button.configure(state=tk.NORMAL, text="重新测试")
         if isinstance(result, BaseException):
-            self._test_status.set(f"测试失败：{result}")
+            self._test_status.set("代理连接测试失败，请查看运行日志。")
             return
         lines: list[str] = []
+        names = {
+            "SOOP 登录域名": "登录服务",
+            "Drops API": "掉宝服务",
+            "SOOP Live API": "直播服务",
+            "Bridge WebSocket": "直播连接",
+        }
         for item in result:
             if item.ok and item.complete:
-                status = "成功"
+                status = "连接成功"
             elif item.ok:
-                status = "可达（未完整鉴权）"
+                status = "代理可用，尚未测试账号鉴权"
             else:
-                status = "失败"
-            lines.append(f"{item.target}：{status} · {item.elapsed_ms} ms · {item.detail}")
+                detail = item.detail.lower()
+                status = "请求超时" if "timeout" in detail else "代理拒绝连接" if "refused" in detail else "连接失败"
+            lines.append(f"{names.get(item.target, item.target)}：{status}（{item.elapsed_ms} ms）")
         self._test_status.set("\n".join(lines))

@@ -42,7 +42,7 @@ APP_NAME = "CloudLight SOOP Drops Miner"
 VERSION = "1.0"
 AUTHOR = "cloudlight"
 AUTHOR_BY = f"by {AUTHOR}"
-PAGE_SUBTITLE = "SOOP Drops 多账号任务管理"
+PAGE_SUBTITLE = "SOOP 掉宝多账号管理工具"
 GITHUB_REPOSITORY_URL = "https://github.com/yundan125/cloudlight-soop-drops-miner"
 LICENSE_NAME = "未声明独立许可证（保留原仓库声明）"
 DEFAULT_CHANNEL_BJID = "owesports"
@@ -57,7 +57,7 @@ DISCLAIMER_TEXT = """CloudLight SOOP Drops Miner 免责说明
 
 3. 本软件按「现状」提供，不对挂机成功率、掉宝进度、奖励领取结果作任何保证。
 
-4. 请妥善保管账号密码与 cookies，勿向他人泄露。因泄露或不当使用造成的损失，开发者不承担责任。
+4. 请妥善保管账号密码与本地登录信息，勿向他人泄露。因泄露或不当使用造成的损失，开发者不承担责任。
 
 5. 仅限个人学习与交流使用。向他人分发本软件时，请一并告知以上条款。
 

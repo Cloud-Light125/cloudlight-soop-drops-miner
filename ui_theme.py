@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import customtkinter as ctk
 
-FONT_FAMILY = "Segoe UI"
+FONT_FAMILY = "Microsoft YaHei UI"
 FONT_CJK = "Microsoft YaHei UI"
 WINDOW_SIZE = "1320x900"
 MIN_WINDOW_SIZE = (1180, 760)

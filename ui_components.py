@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import Any
 
 import customtkinter as ctk
+import tkinter as tk
 
 from .ui_state import AccountUiState, InventoryUiState, MissionUiState, ProgressAnimationState, TierUiState
 from .ui_theme import CARD_PAD, CARD_RADIUS, COLORS, CONTROL_RADIUS, font
@@ -18,10 +19,63 @@ def set_if_changed(widget: Any, option: str, value: Any, cache: dict[str, Any]) 
     return True
 
 
+class ToolTip:
+    """Small user-facing hover hint for controls with limited space."""
+
+    def __init__(self, widget: Any, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self._window: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _show(self, _event: Any = None) -> None:
+        if self._window is not None or not self.text:
+            return
+        window = tk.Toplevel(self.widget)
+        self._window = window
+        window.wm_overrideredirect(True)
+        window.wm_attributes("-topmost", True)
+        x = self.widget.winfo_rootx() + 12
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        window.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            window,
+            text=self.text,
+            justify="left",
+            wraplength=320,
+            padx=9,
+            pady=6,
+            relief="solid",
+            borderwidth=1,
+            font=("Microsoft YaHei UI", 9),
+            background="#FFFBEA",
+            foreground="#202124",
+        )
+        label.pack()
+
+    def _hide(self, _event: Any = None) -> None:
+        if self._window is not None:
+            self._window.destroy()
+            self._window = None
+
+
 class CollapsibleCard(ctk.CTkFrame):
-    def __init__(self, master: Any, title: str, *, expanded: bool = True, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        master: Any,
+        title: str,
+        *,
+        expanded: bool = True,
+        expanded_button_text: str = "收起",
+        collapsed_button_text: str = "展开",
+        **kwargs: Any,
+    ) -> None:
         super().__init__(master, corner_radius=CARD_RADIUS, fg_color=COLORS["surface"], **kwargs)
         self._expanded = expanded
+        self._expanded_button_text = expanded_button_text
+        self._collapsed_button_text = collapsed_button_text
         self.grid_columnconfigure(0, weight=1)
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=CARD_PAD, pady=(12, 8))
@@ -33,7 +87,7 @@ class CollapsibleCard(ctk.CTkFrame):
             width=76,
             height=28,
             corner_radius=CONTROL_RADIUS,
-            text="收起" if expanded else "展开",
+            text=expanded_button_text if expanded else collapsed_button_text,
             fg_color="transparent",
             border_width=1,
             text_color=("#344054", "#D0D5DD"),
@@ -59,10 +113,10 @@ class CollapsibleCard(ctk.CTkFrame):
         self._expanded = expanded
         if expanded:
             self.body.grid()
-            self.toggle_button.configure(text="收起")
+            self.toggle_button.configure(text=self._expanded_button_text)
         else:
             self.body.grid_remove()
-            self.toggle_button.configure(text="展开")
+            self.toggle_button.configure(text=self._collapsed_button_text)
 
 
 class AccountRow(ctk.CTkFrame):
@@ -195,7 +249,11 @@ class MissionTierRow(ctk.CTkFrame):
             or self._state.percent != state.percent
         ):
             self.progress_text.configure(
-                text=f"{state.current_minutes} / {state.required_minutes} 分钟 · {state.percent}%"
+                text=(
+                    f"已观看：{state.current_minutes} 分钟　"
+                    f"目标时长：{state.required_minutes} 分钟　"
+                    f"完成进度：{state.percent}%"
+                )
             )
             self.progress.update_value(state.percent / 100, animate=not initial and self._visible())
             changed.extend(("current_minutes", "percent"))
@@ -241,10 +299,11 @@ class MissionCard(ctk.CTkFrame):
         if old is None or old.status != state.status:
             self.status.configure(text=state.status)
             changed.append("status")
+        channel_status = "符合活动要求" if state.channel_matches else "不符合活动要求"
         meta_value = (
-            f"{state.drops_type} · {state.start_date} 至 {state.end_date}\n"
-            f"频道：{state.channel} · {'匹配' if state.channel_matches else '不匹配'}"
-            + (" · 建议换台" if state.needs_switch else "")
+            f"掉宝类型：{state.drops_type}　活动时间：{state.start_date} 至 {state.end_date}\n"
+            f"当前直播间：{state.channel}　直播间状态：{channel_status}"
+            + ("，建议更换直播间" if state.needs_switch else "")
         )
         old_meta = None if old is None else (
             old.drops_type, old.start_date, old.end_date, old.channel, old.channel_matches, old.needs_switch

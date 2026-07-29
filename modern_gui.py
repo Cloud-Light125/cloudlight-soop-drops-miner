@@ -46,12 +46,15 @@ from .multi_miner import MultiMinerManager
 from .network import AccountNetworkContext, ProxyTestResult, test_proxy_connectivity
 from .single_instance import release_single_instance
 from .systray import TrayMenuState, WinSystray, consume_show_request, create_systray
-from .ui_components import AccountRow, CollapsibleCard, InventoryRow, MissionCard
+from .ui_components import AccountRow, CollapsibleCard, InventoryRow, MissionCard, ToolTip
 from .ui_state import (
     BoundedLogBuffer,
     CallbackMailbox,
     LatestStateMailbox,
     account_ui_state,
+    friendly_account_status,
+    friendly_connection_status,
+    friendly_watch_status,
     format_bytes,
     format_rate,
     inventory_ui_states,
@@ -205,7 +208,13 @@ class ModernSoopGui:
         self._build_settings(self._settings_card.body)
         row += 1
 
-        self._log_card = CollapsibleCard(self._page, "日志", expanded=True)
+        self._log_card = CollapsibleCard(
+            self._page,
+            "运行日志",
+            expanded=True,
+            expanded_button_text="收起日志",
+            collapsed_button_text="查看日志",
+        )
         self._log_card.grid(row=row, column=0, sticky="ew", padx=14, pady=(6, 14))
         self._build_logs(self._log_card.body)
 
@@ -215,20 +224,28 @@ class ModernSoopGui:
         title.grid(row=0, column=0, sticky="ew", padx=CARD_PAD, pady=(14, 4))
         title.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(title, text=APP_NAME, font=font(25, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(title, text=f"{PAGE_SUBTITLE}  ·  版本 {VERSION}  ·  {AUTHOR_BY}", text_color=COLORS["muted"], font=font(12)).grid(row=1, column=0, sticky="w", pady=(2, 0))
-        self._overall_status = ctk.CTkLabel(title, text="就绪", font=font(13, "bold"), text_color=COLORS["success"])
+        ctk.CTkLabel(title, text=f"{PAGE_SUBTITLE} · 版本 {VERSION} · {AUTHOR_BY}", text_color=COLORS["muted"], font=font(12)).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self._overall_status = ctk.CTkLabel(title, text="等待操作", font=font(13, "bold"), text_color=COLORS["success"])
         self._overall_status.grid(row=0, column=1, rowspan=2, sticky="e")
 
         self._header_stats = ctk.CTkLabel(host, text="", anchor="w", justify="left", font=font(12), text_color=COLORS["muted"])
         self._header_stats.grid(row=1, column=0, sticky="ew", padx=CARD_PAD, pady=(4, 8))
+        self._traffic_help = ctk.CTkLabel(
+            host,
+            text="流量数据为软件请求产生的估算值，不包含其他程序的网络流量。",
+            anchor="w",
+            font=font(10),
+            text_color=COLORS["muted"],
+        )
+        self._traffic_help.grid(row=2, column=0, sticky="ew", padx=CARD_PAD, pady=(0, 7))
         actions = ctk.CTkFrame(host, fg_color="transparent")
-        actions.grid(row=2, column=0, sticky="ew", padx=CARD_PAD, pady=(0, 14))
-        self._start_btn = self._button(actions, "全部开始", self._on_start_all, width=112)
+        actions.grid(row=3, column=0, sticky="ew", padx=CARD_PAD, pady=(0, 14))
+        self._start_btn = self._button(actions, "开始全部账号", self._on_start_all, width=132)
         self._start_btn.pack(side="left")
-        self._stop_btn = self._button(actions, "全部停止", self._on_stop_all, width=112, secondary=True)
+        self._stop_btn = self._button(actions, "停止全部账号", self._on_stop_all, width=132, secondary=True)
         self._stop_btn.pack(side="left", padx=(8, 0))
         self._button(actions, "刷新状态", self._refresh_visible_data, width=104, secondary=True).pack(side="left", padx=(8, 0))
-        self._button(actions, "隐藏到托盘", self._minimize_to_tray, width=116, secondary=True).pack(side="left", padx=(8, 0))
+        self._button(actions, "隐藏到系统托盘", self._minimize_to_tray, width=140, secondary=True).pack(side="left", padx=(8, 0))
         self._button(actions, "关于", self._show_about, width=82, secondary=True).pack(side="right")
 
     def _section_title(self, host: Any, title: str, subtitle: str = "") -> None:
@@ -238,46 +255,67 @@ class ModernSoopGui:
 
     def _build_accounts(self, host: ctk.CTkFrame) -> None:
         host.grid_columnconfigure(0, weight=1)
-        self._section_title(host, "账号管理", "点击账号行查看详情；普通刷新会保持选择与滚动位置。")
+        self._section_title(host, "账号管理", "添加 SOOP 账号后，可以分别选择直播间并开始累计掉宝进度。")
         form = ctk.CTkFrame(host, fg_color="transparent")
         form.grid(row=2, column=0, sticky="ew", padx=CARD_PAD, pady=(0, 8))
         form.grid_columnconfigure((0, 1), weight=1)
         self._userid_var = ctk.StringVar()
         self._password_var = ctk.StringVar()
-        ctk.CTkEntry(form, textvariable=self._userid_var, placeholder_text="SOOP 账号", corner_radius=CONTROL_RADIUS).grid(row=0, column=0, sticky="ew", padx=(0, 5))
-        ctk.CTkEntry(form, textvariable=self._password_var, placeholder_text="密码", show="●", corner_radius=CONTROL_RADIUS).grid(row=0, column=1, sticky="ew", padx=(5, 0))
-        self._button(form, "添加账号", self._on_add_account, width=98).grid(row=0, column=2, padx=(10, 0))
-        self._button(form, "删除账号", self._on_remove_account, width=98, secondary=True).grid(row=0, column=3, padx=(8, 0))
+        ctk.CTkLabel(form, text="SOOP 账号", anchor="w", font=font(11, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 5), pady=(0, 3))
+        ctk.CTkLabel(form, text="密码", anchor="w", font=font(11, "bold")).grid(row=0, column=1, sticky="w", padx=(5, 0), pady=(0, 3))
+        ctk.CTkEntry(form, textvariable=self._userid_var, placeholder_text="请输入账号或登录邮箱", corner_radius=CONTROL_RADIUS).grid(row=1, column=0, sticky="ew", padx=(0, 5))
+        ctk.CTkEntry(form, textvariable=self._password_var, placeholder_text="请输入 SOOP 密码", show="●", corner_radius=CONTROL_RADIUS).grid(row=1, column=1, sticky="ew", padx=(5, 0))
+        self._button(form, "添加账号", self._on_add_account, width=98).grid(row=1, column=2, padx=(10, 0))
+        self._button(form, "删除账号", self._on_remove_account, width=98, secondary=True).grid(row=1, column=3, padx=(8, 0))
         headers = ctk.CTkFrame(host, fg_color="transparent")
         headers.grid(row=3, column=0, sticky="ew", padx=CARD_PAD)
-        names = ("账号", "状态", "直播间", "任务", "进度", "Bridge", "心跳", "当前速率")
+        names = ("账号", "运行状态", "当前直播间", "当前任务", "掉宝进度", "直播连接", "观看状态", "当前流量")
         weights = (1, 1, 2, 2, 1, 1, 1, 1)
         for i, (name, weight) in enumerate(zip(names, weights)):
             headers.grid_columnconfigure(i, weight=weight)
-            ctk.CTkLabel(headers, text=name, font=font(11, "bold"), text_color=COLORS["muted"], anchor="w").grid(row=0, column=i, sticky="ew", padx=5)
+            label = ctk.CTkLabel(headers, text=name, font=font(11, "bold"), text_color=COLORS["muted"], anchor="w")
+            label.grid(row=0, column=i, sticky="ew", padx=5)
+            help_text = {
+                "直播连接": "显示账号与当前直播间的连接是否正常。",
+                "观看状态": "显示软件是否正在正常确认观看并累计掉宝时间。",
+                "当前流量": "显示本软件最近一分钟产生的平均网络流量。",
+            }.get(name)
+            if help_text:
+                ToolTip(label, help_text)
         self._account_host = ctk.CTkScrollableFrame(host, height=190, fg_color="transparent")
         self._account_host.grid(row=4, column=0, sticky="nsew", padx=CARD_PAD, pady=(5, CARD_PAD))
         self._account_host.grid_columnconfigure(0, weight=1)
-        self._account_empty = ctk.CTkLabel(self._account_host, text="尚未保存账号", text_color=COLORS["muted"])
+        self._account_empty = ctk.CTkLabel(self._account_host, text="还没有添加账号，请在上方输入账号和密码。", text_color=COLORS["muted"])
         self._account_empty.grid(row=0, column=0, pady=28)
 
     def _build_details(self, host: ctk.CTkFrame) -> None:
         host.grid_columnconfigure(0, weight=1)
-        self._section_title(host, "当前账号状态", "Bridge、心跳和流量均来自账号自身运行状态。")
-        self._detail_hint = ctk.CTkLabel(host, text="请选择一个账号查看详细状态", text_color=COLORS["muted"], font=font(13))
+        self._section_title(host, "当前账号状态", "选择左侧账号后，这里会显示当前直播间、掉宝任务、连接状态和流量信息。")
+        self._detail_hint = ctk.CTkLabel(host, text="请先从左侧选择一个账号", text_color=COLORS["muted"], font=font(13))
         self._detail_hint.grid(row=2, column=0, pady=48)
         self._detail_grid = ctk.CTkFrame(host, fg_color="transparent")
         self._detail_grid.grid(row=2, column=0, sticky="nsew", padx=CARD_PAD, pady=(0, CARD_PAD))
         self._detail_grid.grid_columnconfigure(1, weight=1)
         self._detail_values: dict[str, ctk.CTkLabel] = {}
         rows = (
-            ("UID", "uid"), ("运行状态", "status"), ("频道 / ID", "channel"), ("broadNo", "broad"),
-            ("当前任务", "mission"), ("任务进度", "progress"), ("Bridge / 最近活动", "bridge"),
-            ("最近心跳", "heartbeat"), ("连续失败 / 响应", "heartbeat_result"),
-            ("上传 / 下载", "traffic"), ("累计流量", "total"), ("主要流量来源", "source"),
+            ("账号", "uid"), ("运行状态", "status"), ("当前直播间", "channel"),
+            ("当前任务", "mission"), ("掉宝进度", "progress"), ("直播连接", "connection"),
+            ("最近一次连接活动", "connection_activity"), ("观看状态", "watch"),
+            ("最近一次观看验证", "last_watch"), ("连续失败次数", "failures"),
+            ("当前上传", "upload"), ("当前下载", "download"),
+            ("累计流量", "total"), ("主要流量来源", "source"),
         )
         for i, (caption, key) in enumerate(rows):
-            ctk.CTkLabel(self._detail_grid, text=caption, text_color=COLORS["muted"], anchor="w", font=font(11)).grid(row=i, column=0, sticky="nw", padx=(0, 12), pady=3)
+            caption_label = ctk.CTkLabel(self._detail_grid, text=caption, text_color=COLORS["muted"], anchor="w", font=font(11))
+            caption_label.grid(row=i, column=0, sticky="nw", padx=(0, 12), pady=3)
+            help_text = {
+                "直播连接": "显示账号与当前直播间的连接是否正常。",
+                "观看状态": "显示软件是否正在正常确认观看并累计掉宝时间。",
+                "当前上传": "显示本软件最近一分钟的平均上传流量。",
+                "当前下载": "显示本软件最近一分钟的平均下载流量。",
+            }.get(caption)
+            if help_text:
+                ToolTip(caption_label, help_text)
             label = ctk.CTkLabel(self._detail_grid, text="—", anchor="w", justify="left", wraplength=360, font=font(12))
             label.grid(row=i, column=1, sticky="ew", pady=3)
             self._detail_values[key] = label
@@ -289,29 +327,42 @@ class ModernSoopGui:
         mode_row = ctk.CTkFrame(host, fg_color="transparent")
         mode_row.grid(row=2, column=0, sticky="ew", padx=CARD_PAD, pady=(0, 8))
         self._channel_mode = ctk.StringVar(value="smart")
-        self._mode_control = ctk.CTkSegmentedButton(mode_row, values=["智能选台", "手动选台", "仅 owesports"], command=self._on_mode_segment, corner_radius=CONTROL_RADIUS)
-        self._mode_control.set("智能选台")
+        self._mode_control = ctk.CTkSegmentedButton(
+            mode_row,
+            values=["自动选择", "手动选择", "仅守望先锋赛事频道"],
+            command=self._on_mode_segment,
+            corner_radius=CONTROL_RADIUS,
+        )
+        self._mode_control.set("自动选择")
         self._mode_control.pack(side="left")
-        self._channel_refresh_btn = self._button(mode_row, "刷新频道", self._fetch_channels_async, width=104, secondary=True)
+        self._channel_refresh_btn = self._button(mode_row, "刷新直播间", self._fetch_channels_async, width=118, secondary=True)
         self._channel_refresh_btn.pack(side="right")
         self._channel_body = ctk.CTkFrame(host, fg_color=COLORS["row"], corner_radius=10)
         self._channel_body.grid(row=3, column=0, sticky="ew", padx=CARD_PAD, pady=(0, CARD_PAD))
         self._channel_body.grid_columnconfigure(1, weight=1)
         self._channel_field_label = ctk.CTkLabel(self._channel_body, text="优先任务", anchor="w")
-        self._priority_var = ctk.StringVar(value="自动优先")
-        self._priority = ctk.CTkComboBox(self._channel_body, variable=self._priority_var, values=["自动优先"], state="readonly", corner_radius=CONTROL_RADIUS)
+        self._priority_var = ctk.StringVar(value="自动选择优先任务")
+        self._priority = ctk.CTkComboBox(self._channel_body, variable=self._priority_var, values=["自动选择优先任务"], state="readonly", corner_radius=CONTROL_RADIUS)
         self._manual_var = ctk.StringVar()
         self._manual_combo = ctk.CTkComboBox(self._channel_body, variable=self._manual_var, values=[""], corner_radius=CONTROL_RADIUS)
-        self._channel_hint = ctk.CTkLabel(self._channel_body, text="智能选台会优先匹配当前任务与直播分类。", anchor="w", justify="left", wraplength=1000, text_color=COLORS["muted"])
+        self._channel_hint = ctk.CTkLabel(
+            self._channel_body,
+            text="自动选择会根据当前掉宝任务匹配合适的直播间。找不到符合条件的直播时，会显示具体原因。",
+            anchor="w",
+            justify="left",
+            wraplength=1000,
+            text_color=COLORS["muted"],
+        )
+        ToolTip(self._channel_hint, "“仅守望先锋赛事频道”会固定等待并进入 Overwatch Esports 官方频道 owesports。")
         self._apply_channel_mode_ui()
 
     def _build_missions(self, host: ctk.CTkFrame) -> None:
         host.grid_columnconfigure(0, weight=1)
-        self._section_title(host, "任务进度", "任务卡片和进度条长期复用，仅更新发生变化的字段。")
+        self._section_title(host, "任务进度", "这里显示当前账号参加的掉宝任务、已观看时间、目标时长和奖励领取状态。")
         self._mission_host = ctk.CTkFrame(host, fg_color="transparent")
         self._mission_host.grid(row=2, column=0, sticky="ew", padx=CARD_PAD, pady=(0, CARD_PAD))
         self._mission_host.grid_columnconfigure(0, weight=1)
-        self._mission_empty = ctk.CTkLabel(self._mission_host, text="选择账号后显示任务进度", text_color=COLORS["muted"])
+        self._mission_empty = ctk.CTkLabel(self._mission_host, text="请选择一个账号查看掉宝任务。", text_color=COLORS["muted"])
         self._mission_empty.grid(row=0, column=0, pady=26)
 
     def _build_inventory(self, host: ctk.CTkFrame) -> None:
@@ -323,7 +374,15 @@ class ModernSoopGui:
         self._button(tools, "复制兑换码", self._copy_selected_code, width=112, secondary=True).pack(side="left", padx=(8, 0))
         self._button(tools, "复制全部", self._copy_all_codes, width=96, secondary=True).pack(side="left", padx=(8, 0))
         self._button(tools, "打开官方背包", lambda: webbrowser.open(DROPS_INVENTORY_URL), width=120, secondary=True).pack(side="right")
-        ctk.CTkLabel(host, text="自动领取仅在领取后重新读取 Inventory 并确认状态变化时显示“领取已确认”。兑换码默认掩码。", text_color=COLORS["muted"], anchor="w", font=font(11)).grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        ctk.CTkLabel(
+            host,
+            text="自动领取结果无法确认时，请前往 SOOP 官方背包检查。兑换码默认隐藏，复制时才会读取完整内容。",
+            text_color=COLORS["muted"],
+            anchor="w",
+            justify="left",
+            wraplength=1100,
+            font=font(11),
+        ).grid(row=1, column=0, sticky="ew", pady=(0, 6))
         headers = ctk.CTkFrame(host, fg_color="transparent")
         headers.grid(row=2, column=0, sticky="ew")
         for i, name in enumerate(("账号", "奖励名称", "领取状态", "兑换码", "获得时间", "过期时间")):
@@ -344,44 +403,113 @@ class ModernSoopGui:
             "mission_poll_interval": ctk.StringVar(), "inventory_poll_interval": ctk.StringVar(), "channel_refresh_interval": ctk.StringVar(),
         }
         self._load_settings_vars(self._app_config)
+        ctk.CTkLabel(
+            host,
+            text="修改软件启动方式、代理、掉宝和刷新频率。",
+            text_color=COLORS["muted"],
+            anchor="w",
+            font=font(11),
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
         body = ctk.CTkFrame(host, fg_color="transparent")
-        body.grid(row=0, column=0, sticky="ew")
+        body.grid(row=1, column=0, sticky="ew")
         body.grid_columnconfigure((0, 1, 2), weight=1, uniform="settings")
-        general = self._settings_group(body, "常规", 0)
-        self._switch(general, "开机自启", "auto_start_enabled", command=self._on_auto_start_toggle).pack(anchor="w", pady=3)
-        self._switch(general, "启动后静默进入托盘", "start_minimized_to_tray").pack(anchor="w", pady=3)
-        self._switch(general, "关闭窗口时隐藏到托盘", "close_to_tray").pack(anchor="w", pady=3)
-        ctk.CTkLabel(general, text="主题", anchor="w").pack(fill="x", pady=(10, 3))
+        general = self._settings_group(body, "常规设置", 0)
+        self._switch(general, "开机后自动启动软件", "auto_start_enabled", command=self._on_auto_start_toggle).pack(anchor="w", pady=3)
+        self._switch(general, "启动后直接隐藏到系统托盘", "start_minimized_to_tray").pack(anchor="w", pady=3)
+        self._switch(general, "关闭主窗口时继续在托盘运行", "close_to_tray").pack(anchor="w", pady=3)
+        ctk.CTkLabel(
+            general,
+            text="隐藏到托盘后，正在运行的掉宝任务不会停止。",
+            text_color=COLORS["muted"],
+            anchor="w",
+            justify="left",
+            wraplength=320,
+            font=font(10),
+        ).pack(fill="x", pady=(5, 4))
+        ctk.CTkLabel(general, text="界面主题", anchor="w").pack(fill="x", pady=(8, 3))
         self._theme_control = ctk.CTkSegmentedButton(general, values=["跟随系统", "浅色", "深色"], command=self._preview_theme)
         self._theme_control.set({"system": "跟随系统", "light": "浅色", "dark": "深色"}[self._app_config.appearance_mode])
         self._theme_control.pack(fill="x")
 
         network = self._settings_group(body, "网络", 1)
-        self._switch(network, "启用代理", "proxy_enabled").pack(anchor="w", pady=3)
+        self._switch(network, "使用代理服务器", "proxy_enabled").pack(anchor="w", pady=3)
+        ctk.CTkLabel(network, text="代理地址", anchor="w", font=font(11)).pack(fill="x", pady=(7, 2))
         ctk.CTkEntry(network, textvariable=self._setting_vars["proxy_url"], placeholder_text="http://127.0.0.1:7897", corner_radius=CONTROL_RADIUS).pack(fill="x", pady=(5, 3))
-        self._switch(network, "代理失败后允许直连", "proxy_fallback_direct").pack(anchor="w", pady=3)
-        self._proxy_test_btn = self._button(network, "测试代理", self._test_proxy, width=100, secondary=True)
+        fallback_switch = self._switch(network, "代理不可用时自动改用直连", "proxy_fallback_direct")
+        fallback_switch.pack(anchor="w", pady=3)
+        ToolTip(fallback_switch, "关闭后，代理连接失败时不会自动使用本机直连。")
+        ctk.CTkLabel(
+            network,
+            text="关闭此选项后，代理连接失败时不会自动使用本机直连。",
+            text_color=COLORS["muted"],
+            anchor="w",
+            justify="left",
+            wraplength=320,
+            font=font(10),
+        ).pack(fill="x", pady=(2, 4))
+        self._proxy_test_btn = self._button(network, "测试代理连接", self._test_proxy, width=118, secondary=True)
         self._proxy_test_btn.pack(anchor="w", pady=(8, 4))
         self._proxy_test_status = ctk.CTkLabel(network, text="", justify="left", anchor="w", wraplength=340, text_color=COLORS["muted"], font=font(11))
         self._proxy_test_status.pack(fill="x")
+        ctk.CTkLabel(
+            network,
+            text="代理设置将在下次开始账号或网络重新连接时生效，不会中断当前正在运行的任务。",
+            text_color=COLORS["muted"],
+            anchor="w",
+            justify="left",
+            wraplength=320,
+            font=font(10),
+        ).pack(fill="x", pady=(6, 0))
 
         drops = self._settings_group(body, "掉宝", 2)
-        self._switch(drops, "自动领取奖励", "auto_claim_enabled").pack(anchor="w", pady=3)
-        self._switch(drops, "低流量模式", "low_bandwidth_mode").pack(anchor="w", pady=3)
+        auto_claim_switch = self._switch(drops, "完成任务后尝试自动领取奖励", "auto_claim_enabled")
+        auto_claim_switch.pack(anchor="w", pady=3)
+        ToolTip(auto_claim_switch, "只有官方背包确认奖励状态已变化，软件才会显示领取成功。")
+        ctk.CTkLabel(
+            drops,
+            text="只有在奖励背包确认状态已经变化后，软件才会显示领取成功。无法确认时需要前往官方背包手动领取。",
+            text_color=COLORS["muted"],
+            anchor="w",
+            justify="left",
+            wraplength=320,
+            font=font(10),
+        ).pack(fill="x", pady=(2, 5))
+        low_bandwidth_switch = self._switch(drops, "低流量模式（推荐）", "low_bandwidth_mode")
+        low_bandwidth_switch.pack(anchor="w", pady=3)
+        ToolTip(low_bandwidth_switch, "只发送累计掉宝进度所需的请求，不加载直播视频内容。")
+        ctk.CTkLabel(
+            drops,
+            text="只发送累计掉宝进度所需的请求，不加载直播视频内容。",
+            text_color=COLORS["muted"],
+            anchor="w",
+            justify="left",
+            wraplength=320,
+            font=font(10),
+        ).pack(fill="x", pady=(2, 6))
+        ctk.CTkLabel(drops, text="刷新间隔", anchor="w", font=font(12, "bold")).pack(fill="x", pady=(5, 3))
         for label, key, range_text in (
-            ("Mission 刷新", "mission_poll_interval", "30～600 秒"),
-            ("背包刷新", "inventory_poll_interval", "60～1800 秒"),
-            ("频道列表刷新", "channel_refresh_interval", "60～1800 秒"),
+            ("任务进度刷新间隔（秒）", "mission_poll_interval", "30～600"),
+            ("奖励背包刷新间隔（秒）", "inventory_poll_interval", "60～1800"),
+            ("直播间列表刷新间隔（秒）", "channel_refresh_interval", "60～1800"),
         ):
             line = ctk.CTkFrame(drops, fg_color="transparent")
             line.pack(fill="x", pady=3)
             ctk.CTkLabel(line, text=f"{label}\n{range_text}", anchor="w", justify="left", font=font(11)).pack(side="left")
             ctk.CTkEntry(line, textvariable=self._setting_vars[key], width=78, corner_radius=CONTROL_RADIUS).pack(side="right")
-        self._settings_status = ctk.CTkLabel(host, text="已保存", text_color=COLORS["muted"], anchor="w")
-        self._settings_status.grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ctk.CTkLabel(
+            drops,
+            text="数值越小，状态更新越及时，但网络请求也会更频繁。一般保持默认值即可。",
+            text_color=COLORS["muted"],
+            anchor="w",
+            justify="left",
+            wraplength=320,
+            font=font(10),
+        ).pack(fill="x", pady=(5, 0))
+        self._settings_status = ctk.CTkLabel(host, text="设置已保存。", text_color=COLORS["muted"], anchor="w")
+        self._settings_status.grid(row=2, column=0, sticky="w", pady=(10, 0))
         actions = ctk.CTkFrame(host, fg_color="transparent")
-        actions.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        self._button(actions, "恢复默认值", self._reset_settings_draft, width=112, secondary=True).pack(side="left")
+        actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self._button(actions, "恢复默认设置", self._reset_settings_draft, width=128, secondary=True).pack(side="left")
         self._button(actions, "取消修改", self._cancel_settings_draft, width=104, secondary=True).pack(side="right", padx=(8, 0))
         self._button(actions, "保存设置", self._save_inline_settings, width=104).pack(side="right")
         for variable in self._setting_vars.values():
@@ -396,20 +524,36 @@ class ModernSoopGui:
         return content
 
     def _build_logs(self, host: ctk.CTkFrame) -> None:
+        ctk.CTkLabel(
+            host,
+            text="用于查看账号登录、直播连接、掉宝任务和错误信息。",
+            text_color=COLORS["muted"],
+            anchor="w",
+            font=font(11),
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 7))
         tools = ctk.CTkFrame(host, fg_color="transparent")
-        tools.grid(row=0, column=0, sticky="ew", pady=(0, 7))
+        tools.grid(row=1, column=0, sticky="ew", pady=(0, 7))
         self._log_level_var = ctk.StringVar(value="全部级别")
         self._log_account_var = ctk.StringVar(value="全部账号")
-        ctk.CTkComboBox(tools, width=130, values=["全部级别", "DEBUG", "INFO", "WARNING", "ERROR"], variable=self._log_level_var, state="readonly", command=lambda _: self._rebuild_log_view()).pack(side="left")
+        ctk.CTkComboBox(
+            tools,
+            width=130,
+            values=["全部级别", "调试", "信息", "警告", "错误"],
+            variable=self._log_level_var,
+            state="readonly",
+            command=lambda _: self._rebuild_log_view(),
+        ).pack(side="left")
         self._log_account_filter = ctk.CTkComboBox(tools, width=150, values=["全部账号"], variable=self._log_account_var, state="readonly", command=lambda _: self._rebuild_log_view())
         self._log_account_filter.pack(side="left", padx=(8, 0))
         self._log_autoscroll = ctk.BooleanVar(value=True)
         ctk.CTkSwitch(tools, text="自动滚动", variable=self._log_autoscroll, font=font(11)).pack(side="left", padx=(12, 0))
-        self._button(tools, "复制", self._copy_logs, width=76, secondary=True).pack(side="right")
-        self._button(tools, "清空", self._clear_logs, width=76, secondary=True).pack(side="right", padx=(0, 8))
+        self._button(tools, "复制日志", self._copy_logs, width=92, secondary=True).pack(side="right")
+        self._button(tools, "清空日志", self._clear_logs, width=92, secondary=True).pack(side="right", padx=(0, 8))
         self._log_text = ctk.CTkTextbox(host, height=230, corner_radius=8, font=("Consolas", 11), wrap="word")
-        self._log_text.grid(row=1, column=0, sticky="ew")
+        self._log_text.grid(row=2, column=0, sticky="ew")
+        self._log_text.insert("1.0", "暂时没有运行日志。")
         self._log_text.configure(state="disabled")
+        self._log_placeholder_visible = True
 
     def _button(self, master: Any, text: str, command: Callable[[], None], *, width: int = 100, secondary: bool = False) -> ctk.CTkButton:
         return ctk.CTkButton(
@@ -479,6 +623,9 @@ class ModernSoopGui:
                 visible = [entry[2] for entry in batch if self._log_entry_visible(entry)]
                 if visible:
                     self._log_text.configure(state="normal")
+                    if self._log_placeholder_visible:
+                        self._log_text.delete("1.0", "end")
+                        self._log_placeholder_visible = False
                     self._log_text.insert("end", "\n".join(visible) + "\n")
                     self._log_text.configure(state="disabled")
                     if self._log_autoscroll.get():
@@ -488,7 +635,14 @@ class ModernSoopGui:
 
     def _log_entry_visible(self, entry: tuple[str, str, str]) -> bool:
         level, account, _ = entry
-        return (self._log_level_var.get() in {"全部级别", level}) and (self._log_account_var.get() in {"全部账号", account})
+        selected_level = {
+            "全部级别": "全部级别",
+            "调试": "DEBUG",
+            "信息": "INFO",
+            "警告": "WARNING",
+            "错误": "ERROR",
+        }.get(self._log_level_var.get(), self._log_level_var.get())
+        return (selected_level in {"全部级别", level}) and (self._log_account_var.get() in {"全部账号", account})
 
     def _rebuild_log_view(self) -> None:
         if not hasattr(self, "_log_text"):
@@ -498,6 +652,10 @@ class ModernSoopGui:
         self._log_text.delete("1.0", "end")
         if text:
             self._log_text.insert("end", text + "\n")
+            self._log_placeholder_visible = False
+        else:
+            self._log_text.insert("end", "暂时没有运行日志。")
+            self._log_placeholder_visible = True
         self._log_text.configure(state="disabled")
         if self._log_autoscroll.get():
             self._log_text.see("end")
@@ -583,18 +741,32 @@ class ModernSoopGui:
             buckets = miner._network.stats.by_type
             if buckets:
                 source = max(buckets.items(), key=lambda pair: pair[1].uploaded + pair[1].downloaded)[0]
+        source = {
+            "heartbeat": "观看状态验证",
+            "mission": "任务进度",
+            "inventory": "奖励背包",
+            "channel": "直播间列表",
+            "websocket": "直播连接",
+            "other": "软件网络请求",
+        }.get(source, source)
+        account_state = account_ui_state(state)
         values = {
-            "uid": state.uid, "status": state.status,
-            "channel": f"{state.channel_nick or '—'} / {state.channel_id or '—'}",
-            "broad": state.broad_no or "—", "mission": mission.title if mission else "—",
-            "progress": account_ui_state(state).progress,
-            "bridge": ("已连接" if state.bridge_connected else "未连接") + " / " + (
-                f"{state.bridge_last_activity_seconds:.1f} 秒前" if state.bridge_last_activity_seconds is not None else "—"
+            "uid": state.uid,
+            "status": friendly_account_status(state.status, state.running),
+            "channel": state.channel_nick or state.channel_id or "—",
+            "mission": mission.title if mission else "—",
+            "progress": account_state.progress,
+            "connection": friendly_connection_status(state),
+            "connection_activity": (
+                f"{state.bridge_last_activity_seconds:.1f} 秒前"
+                if state.bridge_last_activity_seconds is not None else "—"
             ),
-            "heartbeat": state.heartbeat_last_success or "—",
-            "heartbeat_result": f"{state.heartbeat_failures} 次 / {state.heartbeat_result or '—'}",
-            "traffic": f"上传 {format_rate(state.network_upload_bps)} / 下载 {format_rate(state.network_download_bps)}",
-            "total": f"{format_bytes(state.network_uploaded + state.network_downloaded)}（应用层估算）",
+            "watch": friendly_watch_status(state),
+            "last_watch": state.heartbeat_last_success or "—",
+            "failures": f"{state.heartbeat_failures} 次",
+            "upload": format_rate(state.network_upload_bps),
+            "download": format_rate(state.network_download_bps),
+            "total": format_bytes(state.network_uploaded + state.network_downloaded),
             "source": source,
         }
         for key, value in values.items():
@@ -624,7 +796,14 @@ class ModernSoopGui:
         if new:
             self._mission_empty.grid_remove()
         else:
-            self._mission_empty.configure(text="该账号暂无任务数据")
+            account = self._states.get(uid)
+            if account is None or not account.running:
+                empty_text = "该账号尚未开始运行。"
+            elif account.status in {"连接中", "重连中"}:
+                empty_text = "正在获取掉宝任务……"
+            else:
+                empty_text = "当前没有检测到可参加的掉宝任务。"
+            self._mission_empty.configure(text=empty_text)
             self._mission_empty.grid()
 
     def _set_inventory(self, items: list[tuple[str, InventoryItem]]) -> None:
@@ -658,7 +837,7 @@ class ModernSoopGui:
 
     # ---------- channels / network data ----------
     def _on_mode_segment(self, value: str) -> None:
-        self._channel_mode.set({"智能选台": "smart", "手动选台": "manual", "仅 owesports": "owesports"}[value])
+        self._channel_mode.set({"自动选择": "smart", "手动选择": "manual", "仅守望先锋赛事频道": "owesports"}[value])
         self._apply_channel_mode_ui()
 
     def _apply_channel_mode_ui(self) -> None:
@@ -669,21 +848,21 @@ class ModernSoopGui:
             self._channel_field_label.configure(text="优先任务")
             self._channel_field_label.grid(row=0, column=0, padx=12, pady=10)
             self._priority.grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=10)
-            self._channel_hint.configure(text="智能选台会优先匹配当前任务与直播分类；必要时提示换台原因。")
+            self._channel_hint.configure(text="自动选择会根据当前掉宝任务匹配合适的直播间。找不到符合条件的直播时，会显示具体原因。")
         elif mode == "manual":
             self._channel_field_label.configure(text="频道 ID 或链接")
             self._channel_field_label.grid(row=0, column=0, padx=12, pady=10)
             self._manual_combo.grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=10)
-            self._channel_hint.configure(text="选择或输入直播间；分类不匹配时只提示，不复制选台业务逻辑。")
+            self._channel_hint.configure(text="从当前可用直播间中选择一个频道。选择不符合活动要求的直播间时，掉宝进度可能不会增加。")
         else:
             self._channel_field_label.grid_remove()
-            self._channel_hint.configure(text="只等待并进入 Overwatch Esports 官方频道 owesports。")
+            self._channel_hint.configure(text="固定等待并进入 Overwatch Esports 官方频道 owesports。")
         self._channel_hint.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 10))
 
     def _get_channel_config(self) -> ChannelConfig:
         priority = PRIORITY_MISSION_AUTO
         selected = self._priority_var.get()
-        if selected and selected != "自动优先":
+        if selected and selected != "自动选择优先任务":
             priority = selected.split(" · ", 1)[0]
         manual = self._manual_var.get().strip()
         mapped = self._channel_map.get(manual)
@@ -695,7 +874,8 @@ class ModernSoopGui:
         if self._channel_loading or (self._in_tray and self._app_config.low_bandwidth_mode):
             return
         self._channel_loading = True
-        self._channel_refresh_btn.configure(state="disabled", text="刷新中…")
+        self._channel_refresh_btn.configure(state="disabled", text="正在刷新……")
+        self._channel_hint.configure(text="正在获取直播间列表……")
         uids = list_accounts()
         config = snapshot_settings(self._app_config)
 
@@ -721,10 +901,12 @@ class ModernSoopGui:
 
     def _finish_channels(self, channels: list[LiveChannel], error: BaseException | None, silent: bool) -> None:
         self._channel_loading = False
-        self._channel_refresh_btn.configure(state="normal", text="刷新频道")
+        self._channel_refresh_btn.configure(state="normal", text="刷新直播间")
         if error:
+            logger.warning("获取直播间失败：%s", error)
+            self._channel_hint.configure(text="获取直播间失败，请检查网络或代理设置。")
             if not silent:
-                messagebox.showerror("刷新频道", str(error), parent=self.root)
+                messagebox.showerror("刷新直播间", "获取直播间失败，请检查网络或代理设置。", parent=self.root)
             return
         self._cached_channels = channels
         values: list[str] = []
@@ -736,6 +918,10 @@ class ModernSoopGui:
         self._manual_combo.configure(values=values or [""])
         if values and not self._manual_var.get():
             self._manual_var.set(values[0])
+        if not values:
+            self._channel_hint.configure(text="暂时没有找到可用直播间，请稍后刷新。")
+        else:
+            self._apply_channel_mode_ui()
         self._append_log(f"频道列表已刷新：{len(channels)} 个")
         self._schedule_channel_refresh()
 
@@ -840,7 +1026,7 @@ class ModernSoopGui:
         if self._quitting or self._starting or (self._thread and self._thread.is_alive()):
             return
         if not list_accounts():
-            messagebox.showinfo("全部开始", "请先添加至少一个账号。", parent=self.root)
+            messagebox.showinfo("开始全部账号", "请先添加至少一个账号。", parent=self.root)
             self._show_main_window()
             return
         self._starting = True
@@ -938,10 +1124,17 @@ class ModernSoopGui:
 
     def _finish_claim(self, uid: str, result: Any) -> None:
         if result.status == ClaimStatus.CLAIMED:
-            messagebox.showinfo("领取奖励", "领取已确认（Inventory 状态已变化）", parent=self.root)
+            messagebox.showinfo("领取奖励", "领取已确认。", parent=self.root)
         else:
-            messagebox.showwarning("领取奖励", "领取未确认，请前往官方背包", parent=self.root)
-        self._append_log(f"[{uid}] 手动领取结果：{result.status.value}")
+            messagebox.showwarning("领取奖励", "自动领取结果无法确认，请前往 SOOP 官方背包检查。", parent=self.root)
+        result_text = {
+            ClaimStatus.CLAIMED: "领取已确认",
+            ClaimStatus.ALREADY_CLAIMED: "奖励已经领取",
+            ClaimStatus.NOT_CLAIMABLE: "尚未达到领取条件",
+            ClaimStatus.UNCONFIRMED: "领取结果无法确认",
+            ClaimStatus.FAILED: "领取失败",
+        }.get(result.status, "领取结果无法确认")
+        self._append_log(f"[{uid}] 手动领取结果：{result_text}")
         self._fetch_inventory_async()
 
     def _copy_selected_code(self) -> None:
@@ -1009,7 +1202,10 @@ class ModernSoopGui:
         except ValueError:
             dirty = True
         self._settings_dirty = dirty
-        self._settings_status.configure(text="有未保存修改" if dirty else "已保存", text_color=COLORS["warning"] if dirty else COLORS["muted"])
+        self._settings_status.configure(
+            text="设置已修改，尚未保存。" if dirty else "设置已保存。",
+            text_color=COLORS["warning"] if dirty else COLORS["muted"],
+        )
 
     def _preview_theme(self, value: str) -> None:
         mode = {"跟随系统": "system", "浅色": "light", "深色": "dark"}[value]
@@ -1037,12 +1233,14 @@ class ModernSoopGui:
             saved = save_settings(draft)
         except Exception as exc:
             configure_appearance(previous.appearance_mode)
-            messagebox.showerror("保存设置", f"保存失败，原设置未改变：{exc}", parent=self.root)
+            logger.error("设置保存失败：%s", exc)
+            self._settings_status.configure(text="设置保存失败，原设置未被修改。", text_color=COLORS["danger"])
+            messagebox.showerror("保存设置", "设置保存失败，原设置未被修改。", parent=self.root)
             return
         self._on_settings_saved(saved)
         self._settings_baseline = snapshot_settings(saved)
         self._settings_dirty = False
-        self._settings_status.configure(text="已保存。新代理设置将在下次启动挂机或网络重连时生效。", text_color=COLORS["success"])
+        self._settings_status.configure(text="设置已保存。", text_color=COLORS["success"])
 
     def _on_settings_saved(self, settings: AppConfig) -> None:
         self._app_config = snapshot_settings(settings)
@@ -1056,7 +1254,7 @@ class ModernSoopGui:
             self._channel_refresh_timer = None
             self._schedule_channel_refresh()
         self._refresh_header()
-        self._append_log("设置已保存；运行中账号的 Session 保持不变")
+        self._append_log("设置已保存；当前正在运行的任务不会中断")
 
     def _cancel_settings_draft(self) -> None:
         self._load_settings_vars(self._settings_baseline)
@@ -1079,11 +1277,11 @@ class ModernSoopGui:
             if not draft.proxy_enabled:
                 raise ValueError("请先启用代理")
         except ValueError as exc:
-            messagebox.showerror("测试代理", str(exc), parent=self.root)
+            messagebox.showerror("测试代理连接", str(exc), parent=self.root)
             return
         self._proxy_testing = True
-        self._proxy_test_btn.configure(state="disabled", text="测试中…")
-        self._proxy_test_status.configure(text="正在测试登录域名、Drops API、Live API 与 Bridge WebSocket…")
+        self._proxy_test_btn.configure(state="disabled", text="正在测试……")
+        self._proxy_test_status.configure(text="正在测试登录服务、掉宝服务、直播服务和直播连接……")
         def worker() -> None:
             try:
                 result = asyncio.run(test_proxy_connectivity(draft))
@@ -1094,14 +1292,30 @@ class ModernSoopGui:
 
     def _finish_proxy_test(self, results: list[ProxyTestResult], error: BaseException | None) -> None:
         self._proxy_testing = False
-        self._proxy_test_btn.configure(state="normal", text="测试代理")
+        self._proxy_test_btn.configure(state="normal", text="重新测试")
         if error:
-            self._proxy_test_status.configure(text=f"测试失败：{error}")
+            logger.warning("代理连接测试失败：%s", error)
+            self._proxy_test_status.configure(text="代理连接测试失败，请查看运行日志。")
             return
         lines = []
+        target_names = {
+            "SOOP 登录域名": "登录服务",
+            "Drops API": "掉宝服务",
+            "SOOP Live API": "直播服务",
+            "Bridge WebSocket": "直播连接",
+        }
         for item in results:
-            status = "成功" if item.ok and item.complete else "链路可达（完整鉴权未测试）" if item.ok else "失败"
-            lines.append(f"{item.target}：{status} · {item.elapsed_ms} ms · {item.detail}")
+            target = target_names.get(item.target, item.target)
+            if item.ok and not item.complete:
+                status = "代理可用，尚未测试账号鉴权"
+            elif item.ok:
+                status = "连接成功"
+            else:
+                detail = item.detail.lower()
+                status = "请求超时" if "timeout" in detail else "代理拒绝连接" if "refused" in detail else "连接失败"
+            lines.append(f"{target}：{status}（{item.elapsed_ms} ms）")
+            if not item.ok:
+                logger.warning("代理测试 %s 失败：%s", item.target, item.detail)
         self._proxy_test_status.configure(text="\n".join(lines))
 
     # ---------- header / tray / windows ----------
@@ -1114,24 +1328,39 @@ class ModernSoopGui:
         uploaded = sum(state.network_uploaded for state in self._states.values())
         downloaded = sum(state.network_downloaded for state in self._states.values())
         rate = sum(state.network_last_minute_bps for state in self._states.values())
-        bridge = "已连接" if selected and selected.bridge_connected else "未连接"
-        heartbeat = "正常" if selected and selected.connection_healthy else "等待/异常"
+        connection = friendly_connection_status(selected) if selected else "未建立"
+        watch = friendly_watch_status(selected) if selected else "等待开始"
         text = (
-            f"账号：{saved} 已保存 / {running} 运行中    当前：{self._selected_uid or '未选择'}    "
-            f"代理：{'已启用' if self._app_config.proxy_enabled else '未启用'}    低流量：{'已启用' if self._app_config.low_bandwidth_mode else '未启用'}\n"
-            f"Bridge：{bridge}    最近心跳：{heartbeat}    一分钟速率：{format_rate(rate)}    "
-            f"本次累计：{format_bytes(uploaded + downloaded)}（应用层估算）"
+            f"账号：{saved} 个已保存　运行中：{running} 个　当前账号：{self._selected_uid or '未选择'}\n"
+            f"网络方式：{'代理' if self._app_config.proxy_enabled else '直连'}　"
+            f"低流量模式：{'已开启' if self._app_config.low_bandwidth_mode else '未开启'}\n"
+            f"直播连接：{connection}　观看状态：{watch}　当前流量：{format_rate(rate)}　"
+            f"累计流量：{format_bytes(uploaded + downloaded)}"
         )
         if self._header_stats.cget("text") != text:
             self._header_stats.configure(text=text)
         if self._starting:
-            self._overall_status.configure(text="启动中…", text_color=COLORS["warning"])
+            self._overall_status.configure(text="正在启动", text_color=COLORS["warning"])
         elif self._stopping:
-            self._overall_status.configure(text="停止中…", text_color=COLORS["warning"])
+            self._overall_status.configure(text="正在停止", text_color=COLORS["warning"])
         else:
-            self._overall_status.configure(text=f"运行中：{running} 个账号" if running else "就绪", text_color=COLORS["success"] if running else COLORS["muted"])
-        self._start_btn.configure(state="disabled" if saved == 0 or self._starting or self._stopping or running else "normal", text="启动中…" if self._starting else "全部开始")
-        self._stop_btn.configure(state="normal" if (running or self._stopping) else "disabled", text="停止中…" if self._stopping else "全部停止")
+            if running:
+                status_text = "正在运行"
+            elif any(state.status == "已停止" for state in self._states.values()):
+                status_text = "已停止"
+            elif any("失败" in state.status or "异常" in state.status for state in self._states.values()):
+                status_text = "连接异常"
+            else:
+                status_text = "等待操作"
+            self._overall_status.configure(text=status_text, text_color=COLORS["success"] if running else COLORS["muted"])
+        self._start_btn.configure(
+            state="disabled" if saved == 0 or self._starting or self._stopping or running else "normal",
+            text="正在启动" if self._starting else "开始全部账号",
+        )
+        self._stop_btn.configure(
+            state="normal" if (running or self._stopping) else "disabled",
+            text="正在停止" if self._stopping else "停止全部账号",
+        )
         if self._tray:
             self._tray.update_state(TrayMenuState(saved, running, self._app_config.proxy_enabled, self._app_config.low_bandwidth_mode, self._starting or self._stopping))
 
@@ -1211,15 +1440,37 @@ class ModernSoopGui:
         window = ctk.CTkToplevel(self.root)
         self._about_window = window
         window.title(f"关于 {APP_NAME}")
-        window.geometry("560x470")
+        window.geometry("620x540")
         window.resizable(False, False)
         window.transient(self.root)
         card = ctk.CTkFrame(window, corner_radius=CARD_RADIUS)
         card.pack(fill="both", expand=True, padx=18, pady=18)
         ctk.CTkLabel(card, text=APP_NAME, font=font(22, "bold")).pack(pady=(24, 4))
-        ctk.CTkLabel(card, text=f"版本 {VERSION}\n\n{PAGE_SUBTITLE}\n\n作者：{AUTHOR}", justify="center", font=font(13)).pack()
+        ctk.CTkLabel(
+            card,
+            text=(
+                f"版本 {VERSION}\n\n"
+                "用于管理 SOOP 掉宝任务的 Windows 桌面工具，\n"
+                "支持多账号、代理、低流量模式和任务进度查看。\n\n"
+                f"作者：{AUTHOR}"
+            ),
+            justify="center",
+            font=font(13),
+        ).pack()
         repo = GITHUB_REPOSITORY_URL or "仓库地址尚未配置"
-        ctk.CTkLabel(card, text=f"\n{LICENSE_NAME}\nPython {platform.python_version()}\n\n第三方工具，与 SOOP 官方无关联\n{repo}", justify="center", wraplength=490, text_color=COLORS["muted"], font=font(11)).pack()
+        ctk.CTkLabel(
+            card,
+            text=(
+                f"\n项目主页：{repo}\n"
+                f"开源许可证：{LICENSE_NAME}\n"
+                f"运行环境：Python {platform.python_version()}\n\n"
+                "本软件为第三方工具，与 SOOP、暴雪娱乐及相关赛事官方无隶属或合作关系。"
+            ),
+            justify="center",
+            wraplength=550,
+            text_color=COLORS["muted"],
+            font=font(11),
+        ).pack()
         actions = ctk.CTkFrame(card, fg_color="transparent")
         actions.pack(fill="x", side="bottom", padx=18, pady=18)
         open_btn = self._button(actions, "打开 GitHub", lambda: webbrowser.open(GITHUB_REPOSITORY_URL), width=110, secondary=True)

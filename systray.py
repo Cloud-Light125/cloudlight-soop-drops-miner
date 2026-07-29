@@ -301,13 +301,13 @@ class WinSystray:
             menu,
             MF_STRING if state.can_start else MF_STRING | MF_GRAYED,
             ID_START_ALL,
-            "全部开始",
+            "开始全部账号",
         )
         user32.AppendMenuW(
             menu,
             MF_STRING if state.can_stop else MF_STRING | MF_GRAYED,
             ID_STOP_ALL,
-            "全部停止",
+            "停止全部账号",
         )
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, f"运行中：{state.running_count} 个账号")
@@ -321,7 +321,7 @@ class WinSystray:
             menu,
             MF_STRING | MF_GRAYED,
             0,
-            f"低流量：{'已启用' if state.low_bandwidth_mode else '未启用'}",
+            f"低流量模式：{'已启用' if state.low_bandwidth_mode else '未启用'}",
         )
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(menu, MF_STRING, ID_EXIT, "退出程序")

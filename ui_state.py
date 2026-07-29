@@ -105,11 +105,13 @@ class InventoryUiState:
 
 
 def format_rate(bits_per_second: float) -> str:
-    if bits_per_second >= 1_000_000:
-        return f"{bits_per_second / 1_000_000:.2f} Mbps（估算）"
-    if bits_per_second >= 1_000:
-        return f"{bits_per_second / 1_000:.1f} Kbps（估算）"
-    return f"{bits_per_second:.0f} bps（估算）"
+    """Format the estimated application traffic as user-friendly bytes/second."""
+    bytes_per_second = max(0.0, bits_per_second) / 8.0
+    if bytes_per_second >= 1024 * 1024:
+        return f"{bytes_per_second / (1024 * 1024):.2f} MB/s"
+    if bytes_per_second >= 1024:
+        return f"{bytes_per_second / 1024:.1f} KB/s"
+    return f"{bytes_per_second:.0f} B/s"
 
 
 def format_bytes(value: int) -> str:
@@ -141,18 +143,60 @@ def _mission_progress(mission: Mission) -> tuple[int, int]:
 def account_ui_state(state: MinerState) -> AccountUiState:
     mission = state.missions[0] if state.missions else None
     current, percent = _mission_progress(mission) if mission else (0, 0)
-    heartbeat = "正常" if state.connection_healthy else (state.heartbeat_result or "等待")
+    heartbeat = friendly_watch_status(state)
     return AccountUiState(
         uid=state.uid,
         running=state.running,
-        status=state.status,
+        status=friendly_account_status(state.status, running=state.running),
         channel=state.channel_nick or state.channel_id or "—",
         mission=mission.title if mission else "—",
         progress=f"{current} 分钟 · {percent}%" if mission else "—",
-        bridge="已连接" if state.bridge_connected else "未连接",
+        bridge=friendly_connection_status(state),
         heartbeat=heartbeat,
         rate=format_rate(state.network_last_minute_bps),
     )
+
+
+def friendly_account_status(status: str, *, running: bool = False) -> str:
+    mapping = {
+        "空闲": "未启动",
+        "已停止": "已停止",
+        "连接中": "正在连接",
+        "重连中": "正在重新连接",
+        "等待直播间": "正在寻找直播间",
+        "挂机中": "正在累计掉宝进度",
+        "挂机中·固定型已结束": "正在累计其他掉宝进度",
+        "未开放掉宝": "当前没有符合条件的直播",
+        "活动已结束": "当前没有符合条件的直播",
+        "进房失败": "连接异常",
+        "无可用直播间": "当前没有符合条件的直播",
+        "登录失败": "登录失败",
+    }
+    return mapping.get(status, "正在运行" if running else "未启动")
+
+
+def friendly_connection_status(state: MinerState) -> str:
+    if state.bridge_connected:
+        return "连接正常"
+    if "重连" in state.status:
+        return "正在重新连接"
+    if state.status in {"进房失败", "连接异常"}:
+        return "连接异常"
+    if state.running:
+        return "正在连接"
+    return "未建立"
+
+
+def friendly_watch_status(state: MinerState) -> str:
+    if state.connection_healthy:
+        return "掉宝计时正常"
+    if state.heartbeat_failures > 0:
+        return "验证失败"
+    if "重连" in state.status:
+        return "正在重新连接"
+    if state.running and state.bridge_connected:
+        return "正在验证观看状态"
+    return "等待开始"
 
 
 def mission_ui_states(uid: str, missions: Iterable[Mission], channel_name: str = "") -> dict[tuple[str, str], MissionUiState]:
@@ -170,7 +214,7 @@ def mission_ui_states(uid: str, missions: Iterable[Mission], channel_name: str =
                     required_minutes=item.give_term,
                     current_minutes=item.view_time,
                     percent=max(0, min(100, item.percent)),
-                    claim_status="已完成" if item.mission_success else "进行中",
+                    claim_status="可以领取" if item.mission_success else "尚未达到领取条件",
                 )
             )
         ended = mission.is_truly_ended
@@ -179,14 +223,24 @@ def mission_ui_states(uid: str, missions: Iterable[Mission], channel_name: str =
             channel_name in {ch.user_id, ch.user_nick} for ch in mission.channels
         )
         needs_switch = bool(channel_name) and bool(mission.channels) and not channel_matches
-        status = "尚未开始" if not_started else "已结束" if ended else "进行中" if mission.is_event_active else "等待"
+        status = (
+            "尚未开始"
+            if not_started
+            else "已结束"
+            if ended
+            else "当前直播间不符合要求"
+            if needs_switch
+            else "正在进行"
+            if mission.is_event_active
+            else "进度已暂停"
+        )
         result[mission_key] = MissionUiState(
             key=mission_key,
             title=mission.title or f"任务 {mission.drops_idx}",
             drops_type=mission.type_label,
             start_date=mission.start_date or "—",
             end_date=mission.end_date or "—",
-            channel=channel_name or "等待选台",
+            channel=channel_name or "等待符合条件的直播",
             channel_matches=channel_matches or not mission.channels,
             current_minutes=current,
             status=status,
@@ -206,7 +260,7 @@ def inventory_ui_states(items: Iterable[tuple[str, InventoryItem]]) -> dict[tupl
             key=key,
             uid=uid,
             name=item.item_name or "未命名奖励",
-            claim_status="领取已确认" if item.claimed else "待手动领取",
+            claim_status="领取已确认" if item.claimed else "需要前往官方背包领取",
             masked_code=mask_code(item.redeem_code),
             received_at=item.receive_date or "—",
             expires_at=item.exp_date or "—",

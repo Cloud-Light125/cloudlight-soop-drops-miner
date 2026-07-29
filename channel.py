@@ -38,7 +38,7 @@ class ChannelConfig:
 
 PRIORITY_MISSION_AUTO = "auto"
 ONE_STREAM_NOTICE = (
-    "说明：同一时间只能挂一个直播间；只有与任务分类/官方台匹配的直播才会累计对应任务进度。"
+    "每个账号同一时间只能进入一个直播间。只有符合掉宝活动要求的直播间，才会累计对应任务的观看进度。"
 )
 
 
