@@ -13,6 +13,10 @@ from .models import DropEvent, InventoryItem, Mission
 logger = logging.getLogger("SoopDropsMiner")
 
 
+class DropsAuthenticationError(RuntimeError):
+    """The account cookies are no longer accepted by the Drops service."""
+
+
 class ClaimStatus(str, Enum):
     CLAIMED = "claimed"
     ALREADY_CLAIMED = "already_claimed"
@@ -57,7 +61,7 @@ class DropsClient:
             data = await resp.json(content_type=None)
             if resp.status == 401 or (isinstance(data, dict) and data.get("result") == -1):
                 msg = data.get("message", "未登录") if isinstance(data, dict) else "未登录"
-                raise RuntimeError(f"Drops API 认证失败: {msg}")
+                raise DropsAuthenticationError(f"Drops API 认证失败: {msg}")
             if resp.status >= 400:
                 raise RuntimeError(f"Drops API HTTP {resp.status}")
             return data

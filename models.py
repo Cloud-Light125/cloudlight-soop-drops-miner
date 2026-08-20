@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 
@@ -112,7 +112,14 @@ class Mission:
     @property
     def is_event_active(self) -> bool:
         """活动进行中（与官网 mission 页「进行中」一致）。"""
-        return self.filter == "progress" and self.live
+        if self.filter != "progress" or not self.live:
+            return False
+        end_at = parse_mission_datetime(self.end_date)
+        if end_at is None:
+            return True
+        if len((self.end_date or "").strip()) <= 10:
+            end_at += timedelta(days=1)
+        return datetime.now() < end_at
 
     @property
     def is_event_ended(self) -> bool:
@@ -121,22 +128,22 @@ class Mission:
 
     @property
     def is_not_yet_open(self) -> bool:
-        """官网标记非进行中，但当前时间早于截止时间 → 尚未开放（非真正结束）。"""
+        """官网标记非进行中，且当前时间早于开始时间。"""
         if self.is_event_active:
             return False
-        end_at = parse_mission_datetime(self.end_date)
-        if end_at is None:
+        start_at = parse_mission_datetime(self.start_date)
+        if start_at is None:
             return False
-        return datetime.now() < end_at
+        return datetime.now() < start_at
 
     @property
     def is_truly_ended(self) -> bool:
         """已超过截止时间，或官网非进行中且无有效截止时间。"""
-        if self.is_event_active:
-            return False
         end_at = parse_mission_datetime(self.end_date)
         if end_at is None:
-            return True
+            return not self.is_event_active and not self.is_not_yet_open
+        if len((self.end_date or "").strip()) <= 10:
+            end_at += timedelta(days=1)
         return datetime.now() >= end_at
 
     @classmethod

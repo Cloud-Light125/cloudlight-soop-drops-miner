@@ -141,7 +141,7 @@ def _mission_progress(mission: Mission) -> tuple[int, int]:
 
 
 def account_ui_state(state: MinerState) -> AccountUiState:
-    mission = state.missions[0] if state.missions else None
+    mission = next((item for item in state.missions if item.is_event_active), None)
     current, percent = _mission_progress(mission) if mission else (0, 0)
     heartbeat = friendly_watch_status(state)
     return AccountUiState(
@@ -157,7 +157,7 @@ def account_ui_state(state: MinerState) -> AccountUiState:
     )
 
 
-def friendly_account_status(status: str, *, running: bool = False) -> str:
+def friendly_account_status(status: str, running: bool | None = None) -> str:
     mapping = {
         "空闲": "未启动",
         "已停止": "已停止",
@@ -171,8 +171,9 @@ def friendly_account_status(status: str, *, running: bool = False) -> str:
         "进房失败": "连接异常",
         "无可用直播间": "当前没有符合条件的直播",
         "登录失败": "登录失败",
+        "登录已失效，请重新添加账号": "登录已失效，请重新添加账号",
     }
-    return mapping.get(status, "正在运行" if running else "未启动")
+    return mapping.get(status, "正在运行" if bool(running) else "未启动")
 
 
 def friendly_connection_status(state: MinerState) -> str:
@@ -188,6 +189,8 @@ def friendly_connection_status(state: MinerState) -> str:
 
 
 def friendly_watch_status(state: MinerState) -> str:
+    if state.heartbeat_status == "unknown":
+        return "观看验证：响应已收到"
     if state.connection_healthy:
         return "掉宝计时正常"
     if state.heartbeat_failures > 0:
@@ -202,6 +205,8 @@ def friendly_watch_status(state: MinerState) -> str:
 def mission_ui_states(uid: str, missions: Iterable[Mission], channel_name: str = "") -> dict[tuple[str, str], MissionUiState]:
     result: dict[tuple[str, str], MissionUiState] = {}
     for mission in missions:
+        if not mission.is_event_active:
+            continue
         mission_key = (uid, mission.drops_idx)
         current, _ = _mission_progress(mission)
         tiers: list[TierUiState] = []

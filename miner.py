@@ -16,7 +16,7 @@ from .constants import (
     HEARTBEAT_INTERVAL,
     NETWORK_RECOVER_COOLDOWN,
 )
-from .drops import ClaimStatus, DropsClient
+from .drops import ClaimStatus, DropsAuthenticationError, DropsClient
 from .channel import (
     ChannelConfig,
     ONE_STREAM_NOTICE,
@@ -33,7 +33,7 @@ from .channel import (
     pick_channel,
 )
 from .models import InventoryItem, LiveChannel, Mission
-from .watch import WatchHeartbeat
+from .watch import HeartbeatStatus, WatchHeartbeat
 from .network import AccountNetworkContext, AccountSession
 
 logger = logging.getLogger("SoopDropsMiner")
@@ -62,6 +62,7 @@ class MinerState:
     heartbeat_last_success: str | None = None
     heartbeat_failures: int = 0
     heartbeat_result: str | None = None
+    heartbeat_status: str | None = None
     connection_healthy: bool = False
     network_uploaded: int = 0
     network_downloaded: int = 0
@@ -108,6 +109,7 @@ class SoopMiner:
         self._bridge_lock = asyncio.Lock()
         self._recover_lock = asyncio.Lock()
         self._bridge_failed = asyncio.Event()
+        self._auth_invalid = False
 
     @staticmethod
     def _is_session_closed_error(exc: BaseException) -> bool:
@@ -140,9 +142,10 @@ class SoopMiner:
                 await self._ensure_bridge()
                 if self._heartbeat and self._bridge and self._bridge.is_connected:
                     try:
-                        if await self._heartbeat.send(self._session):
+                        heartbeat_status = await self._heartbeat.send(self._session)
+                        if heartbeat_status is not HeartbeatStatus.FAILURE:
                             self._heartbeat_fail_streak = 0
-                            self._log.info("账号会话已重建并恢复心跳")
+                            self._log.info("账号会话已重建并收到心跳响应")
                             return
                     except Exception as exc:
                         self._log.warning("重建后的首次心跳失败: %s", exc)
@@ -235,6 +238,7 @@ class SoopMiner:
             ),
             heartbeat_failures=heartbeat.consecutive_failures if heartbeat else 0,
             heartbeat_result=heartbeat.last_response_result if heartbeat else None,
+            heartbeat_status=heartbeat.last_response_status.value if heartbeat else None,
             connection_healthy=bool(
                 heartbeat and heartbeat.connection_healthy and self._bridge and self._bridge.is_connected
             ),
@@ -247,6 +251,8 @@ class SoopMiner:
         )
 
     def _status_text(self) -> str:
+        if self._auth_invalid:
+            return "登录已失效，请重新添加账号"
         if self._stop.is_set():
             return "已停止"
         if not self._running:
@@ -396,8 +402,9 @@ class SoopMiner:
                             self._log_stall(mission, item)
                 self._last_view_times[did] = item.view_time
 
-        if prev_count == 0 and new_count > 0:
-            self._emit_state()
+        # Every mission refresh is a new GUI snapshot: progress can change while
+        # the mission count stays constant.
+        self._emit_state()
 
     async def _sync_channel(self) -> None:
         """按策略选台并更新当前直播间。"""
@@ -549,14 +556,18 @@ class SoopMiner:
                         await self._ensure_bridge()
                     if self._bridge is None or not self._bridge.is_connected:
                         raise ConnectionError("Bridge 未连接")
-                    ok = await self._heartbeat.send(self._session)
-                    if ok:
+                    heartbeat_status = await self._heartbeat.send(self._session)
+                    if heartbeat_status is HeartbeatStatus.SUCCESS:
                         self._heartbeat_fail_streak = 0
+                    elif heartbeat_status is HeartbeatStatus.UNKNOWN:
+                        self._heartbeat_fail_streak = 0
+                        self._log.debug("心跳响应已收到，业务状态待确认: %s", self._heartbeat.last_response_result)
                     else:
                         self._heartbeat_fail_streak += 1
                         self._log.warning("心跳发送失败")
                         if self._heartbeat_fail_streak >= 3:
                             await self._recover_network("连续心跳失败")
+                    self._emit_state()
                 except asyncio.CancelledError:
                     raise
                 except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
@@ -596,6 +607,9 @@ class SoopMiner:
                     await self._fetch_missions()
                 except asyncio.CancelledError:
                     raise
+                except DropsAuthenticationError as exc:
+                    self._handle_auth_expired(exc)
+                    break
                 except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                     self._log.warning("刷新任务网络异常: %s", exc)
                     await self._recover_network("任务刷新")
@@ -620,6 +634,9 @@ class SoopMiner:
                     await self._try_claim()
                 except asyncio.CancelledError:
                     raise
+                except DropsAuthenticationError as exc:
+                    self._handle_auth_expired(exc)
+                    break
                 except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                     self._log.warning("检查背包网络异常: %s", exc)
                     await self._recover_network("背包")
@@ -662,10 +679,14 @@ class SoopMiner:
             "owesports": f"仅 {self._channel_config.preferred_bjid}",
         }
         self._log.info("直播间策略: %s", mode_labels.get(self._channel_config.mode, self._channel_config.mode))
-        await self._ensure_session()
-        if self._session:
-            await self._drops.ensure_drops_ready(on_info=self._log.info)
-        await self._refresh_missions(channel_first=True)
+        try:
+            await self._ensure_session()
+            if self._session:
+                await self._drops.ensure_drops_ready(on_info=self._log.info)
+            await self._refresh_missions(channel_first=True)
+        except DropsAuthenticationError as exc:
+            self._handle_auth_expired(exc)
+            return
         if not self._current:
             self._log.error("无法开始：没有可用的 Drops 直播间")
             self._running = False
@@ -680,6 +701,9 @@ class SoopMiner:
         )
         try:
             await self._refresh_inventory()
+        except DropsAuthenticationError as exc:
+            self._handle_auth_expired(exc)
+            return
         except Exception as exc:
             self._log.warning("加载背包失败: %s", exc)
         self._emit_state("挂机中")
@@ -694,6 +718,13 @@ class SoopMiner:
             await asyncio.gather(hb_task, poll_task, return_exceptions=True)
         self._running = False
         self._emit_state("已停止")
+
+    def _handle_auth_expired(self, exc: BaseException) -> None:
+        self._auth_invalid = True
+        self._running = False
+        self._stop.set()
+        self._log.error("登录已失效，请重新添加账号: %s", exc)
+        self._emit_state("登录已失效，请重新添加账号")
 
 
 async def run_miner(*, userid: str | None = None, password: str | None = None) -> None:

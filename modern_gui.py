@@ -21,6 +21,7 @@ from .channel import (
     PRIORITY_MISSION_AUTO,
     fetch_live_drops_channels,
     format_channel_drops_label,
+    mission_pick_label,
     parse_stream_input,
 )
 from .config import AppConfig, SETTINGS_VERSION, load_settings, reset_settings, save_settings, snapshot_settings
@@ -139,6 +140,9 @@ class ModernSoopGui:
         self._shutdown_deadline = 0.0
         self._channel_loading = False
         self._inventory_loading = False
+        self._channels_loaded = False
+        self._inventory_loaded = False
+        self._render_error_last_log: dict[tuple[str, str, str], float] = {}
         self._proxy_testing = False
         self._tray: WinSystray | None = None
         self._settings_dirty = False
@@ -385,6 +389,8 @@ class ModernSoopGui:
             self._sync_account_rows()
         elif key == "channels":
             self._sync_channel_page()
+            if not self._channels_loaded and not self._channel_loading:
+                self._fetch_channels_async(silent=True)
         elif key == "missions":
             state = self._states.get(self._selected_uid or "")
             if self._selected_uid:
@@ -393,8 +399,14 @@ class ModernSoopGui:
                     state.missions if state else [],
                     (state.channel_nick or state.channel_id or "") if state else "",
                 )
+            else:
+                self._show_no_account_missions()
         elif key == "inventory":
             self._set_inventory(self._all_inventory)
+            if self._inventory_loading:
+                self._inventory_refresh_btn.configure(state="disabled", text="刷新中……")
+            if not self._inventory_loaded and not self._inventory_loading:
+                self._fetch_inventory_async()
         elif key == "logs":
             self._update_log_accounts()
             self._rebuild_log_view()
@@ -769,15 +781,21 @@ class ModernSoopGui:
         self._state_poll_id = None
         if self._quitting:
             return
-        for callback in self._callback_mailbox.drain():
-            try:
-                callback()
-            except Exception:
-                logger.exception("GUI 回调失败")
-        for state in self._state_mailbox.drain().values():
-            self._apply_state(state)
-        interval = 1000 if self._in_tray else 300
-        self._state_poll_id = self.root.after(interval, self._drain_ui_mailboxes)
+        try:
+            for callback in self._callback_mailbox.drain():
+                try:
+                    callback()
+                except Exception:
+                    logger.exception("GUI 回调失败")
+            for state in self._state_mailbox.drain().values():
+                try:
+                    self._apply_state(state)
+                except Exception:
+                    logger.exception("GUI 状态更新失败: uid=%s", state.uid)
+        finally:
+            if not self._quitting:
+                interval = 1000 if self._in_tray else 300
+                self._state_poll_id = self.root.after(interval, self._drain_ui_mailboxes)
 
     def _schedule_ui(self, callback: Callable[[], None]) -> None:
         self._callback_mailbox.submit(callback)
@@ -864,10 +882,10 @@ class ModernSoopGui:
     # ---------- incremental state ----------
     def _refresh_accounts_from_disk(self) -> None:
         uids = list_accounts()
-        if self._selected_uid not in uids:
-            self._selected_uid = uids[0] if uids else None
         if "accounts" in self._pages:
             self._sync_account_rows(uids)
+        elif self._selected_uid not in uids:
+            self._select_account(uids[0] if uids else None)
         if "logs" in self._pages:
             self._update_log_accounts()
         self._refresh_header()
@@ -890,16 +908,14 @@ class ModernSoopGui:
                 self._account_rows[uid] = row
             else:
                 row.update_state(ui)
+            row.set_selected(state.uid == self._selected_uid)
             self._latest_account_ui[uid] = ui
         if uids:
             self._account_empty.grid_remove()
-            if self._selected_uid not in uids:
-                self._selected_uid = uids[0]
-            self._select_account(self._selected_uid)
+            self._select_account(self._selected_uid if self._selected_uid in uids else uids[0])
         else:
-            self._selected_uid = None
             self._account_empty.grid()
-            self._show_detail(None)
+            self._select_account(None)
         self._refresh_account_action_buttons()
 
     def _apply_state(self, state: MinerState) -> None:
@@ -914,6 +930,7 @@ class ModernSoopGui:
                 self._account_empty.grid_remove()
             else:
                 row.update_state(ui)
+            row.set_selected(state.uid == self._selected_uid)
         self._latest_account_ui[state.uid] = ui
         if state.inventory:
             existing = {(uid, item.item_code_idx): (uid, item) for uid, item in self._all_inventory}
@@ -921,30 +938,77 @@ class ModernSoopGui:
                 existing[(state.uid, item.item_code_idx)] = (state.uid, item)
             self._set_inventory(list(existing.values()))
         if self._selected_uid == state.uid:
-            self._cached_missions = list(state.missions)
+            self._cached_missions = [mission for mission in state.missions if mission.is_event_active]
+            if state.available_channels:
+                self._cached_channels = list(state.available_channels)
+                self._channels_loaded = True
             if "accounts" in self._pages:
-                self._show_detail(state)
+                try:
+                    self._show_detail(state)
+                except Exception as exc:
+                    self._log_render_failure_limited("当前账号详情", state.uid, exc)
             if "missions" in self._pages:
-                self._render_missions_incremental(state.uid, state.missions, state.channel_nick or state.channel_id or "")
+                try:
+                    self._render_missions_incremental(
+                        state.uid,
+                        state.missions,
+                        state.channel_nick or state.channel_id or "",
+                    )
+                except Exception as exc:
+                    self._log_render_failure_limited("任务页面", state.uid, exc)
         self._refresh_account_action_buttons()
         self._refresh_header()
 
-    def _select_account(self, uid: str | None) -> None:
-        if not uid:
+    def _log_render_failure_limited(self, area: str, uid: str, exc: BaseException) -> None:
+        key = (area, type(exc).__name__, str(exc)[:160])
+        now = time.monotonic()
+        last_logs = getattr(self, "_render_error_last_log", None)
+        if last_logs is None:
+            last_logs = self._render_error_last_log = {}
+        if now - last_logs.get(key, 0.0) < 30.0:
             return
-        previous = self._selected_uid
+        last_logs[key] = now
+        logger.error(
+            "%s更新失败: uid=%s",
+            area,
+            uid,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+    def _select_account(self, uid: str | None) -> None:
         self._selected_uid = uid
-        if "accounts" in self._pages and previous in self._account_rows:
-            self._account_rows[previous].set_selected(False)
-        if "accounts" in self._pages and uid in self._account_rows:
-            self._account_rows[uid].set_selected(True)
-        state = self._states.get(uid, MinerState(uid=uid))
         if "accounts" in self._pages:
-            self._show_detail(state)
+            for row_uid, row in self._account_rows.items():
+                row.set_selected(row_uid == uid)
+        state = self._states.get(uid) if uid else None
+        self._cached_missions = [mission for mission in state.missions if mission.is_event_active] if state else []
+        if state is not None:
+            self._cached_channels = list(state.available_channels)
+            self._channels_loaded = bool(self._cached_channels)
+        if "accounts" in self._pages:
+            self._show_detail(state or (MinerState(uid=uid) if uid else None))
         if "missions" in self._pages:
-            self._render_missions_incremental(uid, state.missions, state.channel_nick or state.channel_id or "")
+            if uid:
+                display_state = state or MinerState(uid=uid)
+                self._render_missions_incremental(
+                    uid,
+                    display_state.missions,
+                    display_state.channel_nick or display_state.channel_id or "",
+                )
+            else:
+                self._show_no_account_missions()
+        if "channels" in self._pages:
+            self._sync_channel_page()
         self._refresh_account_action_buttons()
         self._refresh_header()
+
+    def _show_no_account_missions(self) -> None:
+        if "missions" not in self._pages:
+            return
+        for card in self._mission_cards.values():
+            card.grid_remove()
+        self._mission_empty.configure(text="请先选择一个账号")
+        self._mission_empty.grid()
 
     def _show_detail(self, state: MinerState | None) -> None:
         if "accounts" not in self._pages:
@@ -955,7 +1019,7 @@ class ModernSoopGui:
             return
         self._detail_hint.grid_remove()
         self._detail_grid.grid()
-        mission = state.missions[0] if state.missions else None
+        mission = next((item for item in state.missions if item.is_event_active), None)
         source = "—"
         miner = self._manager.get_miner(state.uid) if self._manager else None
         if miner is not None:
@@ -973,7 +1037,7 @@ class ModernSoopGui:
         account_state = account_ui_state(state)
         values = {
             "uid": state.uid,
-            "status": friendly_account_status(state.status, state.running),
+            "status": friendly_account_status(state.status, running=state.running),
             "channel": state.channel_nick or state.channel_id or "—",
             "mission": mission.title if mission else "—",
             "progress": account_state.progress,
@@ -1021,11 +1085,11 @@ class ModernSoopGui:
         else:
             account = self._states.get(uid)
             if account is None or not account.running:
-                empty_text = "该账号尚未开始运行。"
+                empty_text = "该账号尚未开始运行"
             elif account.status in {"连接中", "重连中"}:
                 empty_text = "正在获取掉宝任务……"
             else:
-                empty_text = "当前没有检测到可参加的掉宝任务。"
+                empty_text = "当前没有检测到可参加的掉宝任务"
             self._mission_empty.configure(text=empty_text)
             self._mission_empty.grid()
 
@@ -1050,6 +1114,7 @@ class ModernSoopGui:
         if new:
             self._inventory_empty.grid_remove()
         else:
+            self._inventory_empty.configure(text="当前奖励背包暂无内容")
             self._inventory_empty.grid()
 
     def _select_inventory(self, key: tuple[str, str]) -> None:
@@ -1113,10 +1178,19 @@ class ModernSoopGui:
         self._mode_control.set({"smart": "自动选择", "manual": "手动选择", "owesports": "仅守望先锋赛事频道"}[self._channel_mode_value])
         self._priority_var.set(self._channel_priority_value)
         self._manual_var.set(self._channel_manual_value)
+        priority_values = [
+            "自动选择优先任务",
+            *(f"{mission.drops_idx} · {mission_pick_label(mission)}" for mission in self._cached_missions),
+        ]
+        self._priority.configure(values=priority_values)
+        if self._priority_var.get() not in priority_values:
+            self._priority_var.set("自动选择优先任务")
+            self._channel_priority_value = "自动选择优先任务"
         values: list[str] = []
         self._channel_map.clear()
         for channel in self._cached_channels:
-            label = format_channel_drops_label(channel)
+            drops_label = format_channel_drops_label(channel, self._cached_missions)
+            label = f"{channel.user_nick or channel.user_id} ({channel.user_id}) · {drops_label}"
             values.append(label)
             self._channel_map[label] = channel
         self._manual_combo.configure(values=values or [""])
@@ -1124,6 +1198,18 @@ class ModernSoopGui:
             self._manual_var.set(values[0])
             self._channel_manual_value = values[0]
         self._apply_channel_mode_ui()
+        if self._channel_loading:
+            self._channel_refresh_btn.configure(state="disabled", text="正在刷新……")
+            self._channel_hint.configure(text="正在获取直播间列表……")
+        elif self._channels_loaded:
+            self._channel_refresh_btn.configure(state="normal", text="刷新直播间")
+            self._channel_hint.configure(
+                text=(
+                    f"已找到 {len(self._cached_channels)} 个可用直播间"
+                    if self._cached_channels
+                    else "暂时没有找到符合条件的直播间"
+                )
+            )
 
     def _fetch_channels_async(self, *, silent: bool = False) -> None:
         if self._channel_loading or (self._in_tray and self._app_config.low_bandwidth_mode):
@@ -1134,6 +1220,7 @@ class ModernSoopGui:
             self._channel_hint.configure(text="正在获取直播间列表……")
         uids = list_accounts()
         config = snapshot_settings(self._app_config)
+        missions = list(self._cached_missions)
 
         def worker() -> None:
             async def load() -> list[LiveChannel]:
@@ -1144,7 +1231,8 @@ class ModernSoopGui:
                     context = AccountNetworkContext(uid, cookies, config)
                     session = await context.open()
                     try:
-                        return await fetch_live_drops_channels(session, cookies, self._cached_missions)
+                        online, _offline = await fetch_live_drops_channels(session, cookies, missions)
+                        return online
                     finally:
                         await context.close()
                 return []
@@ -1156,27 +1244,38 @@ class ModernSoopGui:
         threading.Thread(target=worker, name="GuiChannelRefresh", daemon=True).start()
 
     def _finish_channels(self, channels: list[LiveChannel], error: BaseException | None, silent: bool) -> None:
-        self._channel_loading = False
-        if "channels" in self._pages:
-            self._channel_refresh_btn.configure(state="normal", text="刷新直播间")
-        if error:
-            logger.warning("获取直播间失败：%s", error)
+        try:
+            if error:
+                logger.error(
+                    "获取直播间失败",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                if "channels" in self._pages:
+                    self._channel_hint.configure(text="获取直播间失败")
+                if not silent:
+                    messagebox.showerror("刷新直播间", "获取直播间失败，请检查网络或代理设置。", parent=self.root)
+                return
+            self._cached_channels = list(channels)
+            self._channels_loaded = True
             if "channels" in self._pages:
-                self._channel_hint.configure(text="获取直播间失败，请检查网络或代理设置。")
-            if not silent:
-                messagebox.showerror("刷新直播间", "获取直播间失败，请检查网络或代理设置。", parent=self.root)
-            return
-        self._cached_channels = channels
-        self._channel_map.clear()
-        for channel in channels:
-            label = format_channel_drops_label(channel)
-            self._channel_map[label] = channel
-        if "channels" in self._pages:
-            self._sync_channel_page()
-            if not channels:
-                self._channel_hint.configure(text="暂时没有找到可用直播间，请稍后刷新。")
-        self._append_log(f"频道列表已刷新：{len(channels)} 个")
-        self._schedule_channel_refresh()
+                self._sync_channel_page()
+                self._channel_hint.configure(
+                    text=(
+                        f"已找到 {len(channels)} 个可用直播间"
+                        if channels
+                        else "暂时没有找到符合条件的直播间"
+                    )
+                )
+            self._append_log(f"频道列表已刷新：{len(channels)} 个")
+            self._schedule_channel_refresh()
+        except Exception:
+            logger.exception("渲染直播间列表失败")
+            if "channels" in self._pages:
+                self._channel_hint.configure(text="获取直播间失败")
+        finally:
+            self._channel_loading = False
+            if "channels" in self._pages:
+                self._channel_refresh_btn.configure(state="normal", text="刷新直播间")
 
     def _schedule_channel_refresh(self) -> None:
         if self._channel_refresh_timer:
@@ -1191,7 +1290,7 @@ class ModernSoopGui:
             return
         self._inventory_loading = True
         if "inventory" in self._pages:
-            self._inventory_refresh_btn.configure(state="disabled", text="刷新中…")
+            self._inventory_refresh_btn.configure(state="disabled", text="刷新中……")
         uids = list_accounts()
         config = snapshot_settings(self._app_config)
 
@@ -1218,14 +1317,23 @@ class ModernSoopGui:
         threading.Thread(target=worker, name="GuiInventoryRefresh", daemon=True).start()
 
     def _finish_inventory(self, items: list[tuple[str, InventoryItem]], error: BaseException | None) -> None:
-        self._inventory_loading = False
-        if "inventory" in self._pages:
-            self._inventory_refresh_btn.configure(state="normal", text="刷新背包")
-        if error:
-            messagebox.showerror("刷新背包", str(error), parent=self.root)
-            return
-        self._set_inventory(items)
-        self._append_log(f"背包已刷新：{len(items)} 项")
+        try:
+            if error:
+                logger.error(
+                    "获取奖励背包失败",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                messagebox.showerror("刷新背包", str(error), parent=self.root)
+                return
+            self._inventory_loaded = True
+            self._set_inventory(items)
+            self._append_log(f"背包已刷新：{len(items)} 项")
+        except Exception:
+            logger.exception("渲染奖励背包失败")
+        finally:
+            self._inventory_loading = False
+            if "inventory" in self._pages:
+                self._inventory_refresh_btn.configure(state="normal", text="刷新背包")
 
     # ---------- accounts / actions ----------
     def _on_add_account(self) -> None:
@@ -1244,8 +1352,8 @@ class ModernSoopGui:
 
     def _after_add_account(self, uid: str) -> None:
         self._password_var.set("")
-        self._selected_uid = uid
         self._refresh_accounts_from_disk()
+        self._select_account(uid)
         self._append_log(f"已添加账号：{uid}", account=uid)
         self._fetch_inventory_async()
 
@@ -1261,7 +1369,6 @@ class ModernSoopGui:
             remove_account(uid)
             self._states.pop(uid, None)
             self._all_inventory = [(u, item) for u, item in self._all_inventory if u != uid]
-            self._selected_uid = None
             self._refresh_accounts_from_disk()
             self._set_inventory(self._all_inventory)
             self._append_log(f"已删除账号：{uid}")

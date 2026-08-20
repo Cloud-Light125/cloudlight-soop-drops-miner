@@ -7,6 +7,7 @@ import re
 import secrets
 import time
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -23,6 +24,16 @@ from .constants import (
 from .models import LiveChannel
 
 logger = logging.getLogger("SoopDropsMiner.watch")
+
+
+class HeartbeatStatus(str, Enum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+    UNKNOWN = "unknown"
+
+    def __bool__(self) -> bool:
+        """Keep legacy truth checks safe while callers migrate to explicit states."""
+        return self is HeartbeatStatus.SUCCESS
 
 
 def encode_a(fields: dict[str, Any]) -> str:
@@ -74,6 +85,7 @@ class WatchHeartbeat:
         self.last_success_time: datetime | None = None
         self.consecutive_failures = 0
         self.last_response_result = "尚未发送"
+        self.last_response_status = HeartbeatStatus.UNKNOWN
         self.connection_healthy = False
 
     def switch_channel(
@@ -96,6 +108,7 @@ class WatchHeartbeat:
         self.last_success_time = None
         self.consecutive_failures = 0
         self.last_response_result = "频道已切换，等待心跳"
+        self.last_response_status = HeartbeatStatus.UNKNOWN
         self.connection_healthy = False
 
     def _base_fields(self, *, m_type: str = "B", s_type: str = "2", extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -196,31 +209,49 @@ class WatchHeartbeat:
         return "3" if self._tick % 5 == 2 else "2"
 
     @staticmethod
-    def _response_is_success(text: str, content_type: str) -> tuple[bool, str]:
+    def _classify_response(text: str, content_type: str) -> tuple[HeartbeatStatus, str]:
         stripped = text.strip()
         if not stripped:
-            return False, "空响应"
+            return HeartbeatStatus.FAILURE, "空响应"
         data: Any = None
         if "json" in content_type.lower() or stripped.startswith(("{", "[")):
             try:
                 data = json.loads(stripped)
             except json.JSONDecodeError:
-                return False, "JSON 无法解析"
+                return HeartbeatStatus.FAILURE, "JSON 无法解析"
             if isinstance(data, dict):
                 if data.get("nRet") in (0, "0"):
-                    return True, "nRet=0"
+                    return HeartbeatStatus.SUCCESS, "nRet=0"
                 if data.get("result") in (1, "1", True) or data.get("success") is True:
-                    return True, "明确成功字段"
-                return False, "JSON 未包含成功码"
-            return False, "JSON 根节点不是对象"
+                    return HeartbeatStatus.SUCCESS, "明确成功字段"
+                if data.get("nRet") in (-1, "-1") or data.get("result") in (-1, "-1"):
+                    return HeartbeatStatus.FAILURE, "明确失败码"
+                if data.get("success") is False:
+                    return HeartbeatStatus.FAILURE, "明确失败字段"
+                nret = data.get("nRet")
+                message = data.get("szMsg")
+                detail = f"nRet={nret} szMsg={message}" if nret is not None else "JSON 业务状态待确认"
+                return HeartbeatStatus.UNKNOWN, detail
+            return HeartbeatStatus.FAILURE, "JSON 根节点不是对象"
 
         values = parse_qs(stripped, keep_blank_values=True)
         if values.get("nRet") and values["nRet"][0].strip() == "0":
-            return True, "nRet=0"
+            return HeartbeatStatus.SUCCESS, "nRet=0"
+        if values.get("nRet"):
+            value = values["nRet"][0].strip()
+            if value == "-1":
+                return HeartbeatStatus.FAILURE, "明确失败码"
+            return HeartbeatStatus.UNKNOWN, f"nRet={value}"
         match = re.fullmatch(r"(?:nRet|NRET)\s*[:=]\s*0(?:\s*[;,]\s*[^=;,]+\s*[:=]\s*[^;,]*)*", stripped)
         if match:
-            return True, "nRet=0"
-        return False, "文本未包含可识别成功码"
+            return HeartbeatStatus.SUCCESS, "nRet=0"
+        return HeartbeatStatus.FAILURE, "文本响应不符合已知协议"
+
+    @staticmethod
+    def _response_is_success(text: str, content_type: str) -> tuple[bool, str]:
+        """Compatibility wrapper for older callers and tests."""
+        status, result = WatchHeartbeat._classify_response(text, content_type)
+        return status is HeartbeatStatus.SUCCESS, result
 
     @staticmethod
     def _safe_summary(text: str, limit: int = 240) -> str:
@@ -231,16 +262,23 @@ class WatchHeartbeat:
         )
         return summary[:limit]
 
-    def _record_result(self, ok: bool, result: str) -> None:
+    def _record_result(self, status: HeartbeatStatus, result: str) -> None:
+        self.last_response_status = status
         self.last_response_result = result
-        self.connection_healthy = ok
-        if ok:
+        if status is HeartbeatStatus.SUCCESS:
+            self.connection_healthy = True
             self.consecutive_failures = 0
             self.last_success_time = datetime.now(timezone.utc)
+        elif status is HeartbeatStatus.UNKNOWN:
+            # A valid HTTP response proves the transport path is alive.  Its
+            # undocumented business code must not become a reconnect trigger.
+            self.connection_healthy = True
+            self.consecutive_failures = 0
         else:
+            self.connection_healthy = False
             self.consecutive_failures += 1
 
-    async def send(self, session: aiohttp.ClientSession) -> bool:
+    async def send(self, session: aiohttp.ClientSession) -> HeartbeatStatus:
         s_type = self._next_s_type()
         if s_type == "L":
             payload = self.build_payload(m_type="L", s_type="")
@@ -264,25 +302,27 @@ class WatchHeartbeat:
                 content_type = resp.headers.get("Content-Type", "")
                 if resp.status != 200:
                     result = f"HTTP {resp.status}"
-                    self._record_result(False, result)
+                    self._record_result(HeartbeatStatus.FAILURE, result)
                     logger.warning(
                         "心跳响应失败: status=%s content_type=%s body=%r",
                         resp.status,
                         content_type or "<missing>",
                         self._safe_summary(text),
                     )
-                    return False
-                ok, result = self._response_is_success(text, content_type)
-                self._record_result(ok, result)
-                if not ok:
+                    return HeartbeatStatus.FAILURE
+                status, result = self._classify_response(text, content_type)
+                self._record_result(status, result)
+                if status is HeartbeatStatus.FAILURE:
                     logger.warning(
-                        "心跳响应无法确认: status=%s content_type=%s result=%s body=%r",
+                        "心跳响应失败: status=%s content_type=%s result=%s body=%r",
                         resp.status,
                         content_type or "<missing>",
                         result,
                         self._safe_summary(text),
                     )
-                return ok
+                elif status is HeartbeatStatus.UNKNOWN:
+                    logger.debug("心跳响应状态待确认: %s", result)
+                return status
         except Exception as exc:
-            self._record_result(False, f"请求异常: {type(exc).__name__}")
+            self._record_result(HeartbeatStatus.FAILURE, f"请求异常: {type(exc).__name__}")
             raise

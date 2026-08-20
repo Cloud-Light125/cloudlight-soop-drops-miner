@@ -82,7 +82,7 @@ class MultiMinerManager:
                 await miner.__aexit__()
                 self._miners.pop(uid, None)
                 self._tasks.pop(uid, None)
-                self._callback(MinerState(uid=uid, status="已停止"))
+                self._callback(miner.get_state())
 
     def stop_account(self, uid: str) -> None:
         if uid in self._miners:
