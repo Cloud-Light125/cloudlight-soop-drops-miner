@@ -65,13 +65,45 @@ yarl>=1.9.0
 
 ## 2. 与上游仓库的关系
 
-本仓库根目录 `TwitchDropsMiner-master` 源自开源项目 [Twitch Drops Miner](https://github.com/DevilXD/TwitchDropsMiner)（Twitch 掉宝挂机）。
+### 2.1 直接源码基础：tom1230123/soop-drops-miner
 
-`仓库根目录` 是**独立子项目**，面向 SOOP Live 平台：
+当前 CloudLight 仓库是 [**tom1230123/soop-drops-miner**](https://github.com/tom1230123/soop-drops-miner) 的直接后续开发版本，并非与其无关的独立重写：
 
-- 拥有独立的模块、API 对接与 GUI，**不依赖** Twitch 相关代码运行。
-- 可单独开源、单独打包为 `CloudLight_SOOP_Drops_Miner.exe`。
-- 上级目录 `soop_tools/` 为本地逆向/抓包辅助脚本，**不纳入 Git 仓库**，不参与运行时。
+- 当前 Git 仍将该仓库保留为 `origin`；双方共享 `e8a28dd` 至 `b707485` 的最初提交历史，CloudLight 的提交直接接续在 `b707485` 之后。
+- 早期的 `auth.py`、`drops.py`、`center.py`、`watch.py`、`miner.py`、`models.py` 与 GUI 等模块直接来自该 SOOP 项目的源码基础。
+- SOOP 登录、Drops API、Bridge WebSocket 进房、CSTATUS 观看心跳、任务/背包轮询和直播间选择等早期实现，应归功于该项目原作者与贡献者。
+
+上游 README 的原始版本署名为 `www5329`，仓库位于 `tom1230123` 账号下；现有资料不足以确认两者是否为同一身份，因此本文不作额外推断。`cloudlight` 表示当前项目维护者与 CloudLight 版本作者，不替代上游的原始署名与贡献记录。
+
+### 2.2 CloudLight 版本的后续重构与扩展
+
+CloudLight 版本在直接源码基础上进行了较大规模的重构与扩展，主要包括：
+
+- 强化每个账号独立的 Cookie、HTTP/WebSocket Session、代理路由与流量统计边界；
+- 改进 Bridge WebSocket、观看心跳的状态判定、连续失败恢复与会话重建；
+- 增加代理、低流量模式以及自动领取后的背包状态验证；
+- 完善 Windows 系统托盘、开机自启、单实例与设置持久化；
+- 将 GUI 重构为 CustomTkinter 多页面界面，并加入线程安全的状态合并、状态同步和增量刷新。
+
+这些后续工作构成 CloudLight 版本的主要维护与扩展内容，但不改变 `tom1230123/soop-drops-miner` 是本项目直接源码基础这一事实。
+
+### 2.3 间接参考：DevilXD/TwitchDropsMiner
+
+[**DevilXD/TwitchDropsMiner**](https://github.com/DevilXD/TwitchDropsMiner) 属于设计思路参考（inspiration），不是当前 SOOP 项目的直接源码上游。早期文档中关于 `TwitchDropsMiner-master` 的描述反映的是开发时的父目录或参考背景；根据当前可见的 Git 历史、初始源码结构与实现比对：
+
+- 两个仓库没有可见的共同 Git 提交历史；
+- 当前项目使用 SOOP 专属的登录、Drops REST API、Bridge WebSocket 与观看心跳协议，不依赖 Twitch 代码运行；
+- 未发现足以将 `DevilXD/TwitchDropsMiner` 认定为当前仓库直接 fork 或直接源码基础的证据。
+
+因此，本项目对其定位为 Drops Miner 产品与设计方向上的间接参考，不将其描述为直接派生关系。
+
+### 2.4 许可证与声明
+
+- `tom1230123/soop-drops-miner` 的当前树及可见历史中均未提供 `LICENSE`、`NOTICE` 或其他明确的源码许可证；本仓库目前也未声明独立许可证。因此，上游源码的使用与再分发许可仍不明确，README 中的鸣谢不能替代许可证授权。
+- `DevilXD/TwitchDropsMiner` 使用 MIT License，并要求复制或分发其实质代码时保留版权与许可声明。现有核对未将其认定为本仓库的直接源码基础；其 MIT License 只适用于该项目自身，不能作为当前 SOOP 仓库的许可证。
+- 在许可证状态进一步确认前，不删除或替换任何可确认的原作者信息，也不将当前版本表述为完全原创或与其他项目无关。
+
+上级目录 `soop_tools/` 为本地逆向/抓包辅助脚本，不纳入本 Git 仓库，也不参与运行时。
 
 ---
 

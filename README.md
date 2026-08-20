@@ -10,7 +10,17 @@ SOOP Live（原 AfreecaTV）掉宝挂机工具，支持多账号并行、图形�
 
 🌐 **GitHub**：[yundan125/cloudlight-soop-drops-miner](https://github.com/yundan125/cloudlight-soop-drops-miner)
 
-许可证状态：当前仓库未声明独立许可证；保留原仓库中的既有声明与历史。
+许可证状态：当前仓库及其直接源码基础均未提供明确的 `LICENSE`；源码使用与再分发许可仍不明确，鸣谢不构成许可证授权。
+
+---
+
+## 🙏 鸣谢
+
+CloudLight SOOP Drops Miner 的早期实现直接建立在 [**tom1230123/soop-drops-miner**](https://github.com/tom1230123/soop-drops-miner) 的工作基础上。感谢该项目原作者与贡献者对 SOOP 登录、Drops API、直播间连接、观看状态等关键实现所做的探索；这些工作构成了本项目最初的源码基础。
+
+当前 CloudLight 版本由 **cloudlight** 维护，并在上述基础上进行了较大规模的重构与扩展，包括强化多账号独立 Session、WebSocket 与心跳稳定性，加入代理、低流量模式、自动领取验证、Windows 托盘与开机自启，以及重构 CustomTkinter 多页面界面、状态同步和增量刷新。后续修改不应掩盖原项目对本项目早期实现的贡献。
+
+[**DevilXD/TwitchDropsMiner**](https://github.com/DevilXD/TwitchDropsMiner) 为本项目开发过程中的设计思路参考（inspiration）。经现有 Git 历史与源码结构核对，它不是当前 SOOP 项目的直接源码上游，当前项目也不是该仓库的直接 fork。
 
 ---
 
