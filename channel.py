@@ -423,7 +423,11 @@ def filter_missions_by_priority(
     active = active_progress_missions(missions)
     if not priority_mission_id or priority_mission_id == PRIORITY_MISSION_AUTO:
         return active
-    return [m for m in active if m.drops_idx == priority_mission_id]
+    selected = [m for m in active if m.drops_idx == priority_mission_id]
+    # A manually selected campaign may end between two polls. Continue with
+    # the current active missions instead of pinning the miner to a stale ID
+    # forever; the persisted setting is still left untouched.
+    return selected or active
 
 
 def manual_channel_mismatch_warnings(

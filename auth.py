@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import stat
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -48,6 +49,12 @@ def migrate_legacy_cookies() -> str | None:
     dest = cookies_path_for(uid)
     if not dest.is_file():
         save_cookies(cookies, uid)
+    # The legacy file is only a migration source. Keeping it makes a later
+    # list_accounts() call recreate an account that the user just deleted.
+    try:
+        COOKIES_PATH.unlink()
+    except OSError:
+        pass
     return uid
 
 
@@ -105,8 +112,19 @@ def remove_account(userid: str) -> bool:
     path = ACCOUNTS_DIR / userid
     if not path.is_dir():
         return False
-    shutil.rmtree(path)
-    return True
+
+    def remove_readonly(func, target, _exc_info) -> None:
+        try:
+            Path(target).chmod(stat.S_IWRITE)
+        except OSError:
+            pass
+        func(target)
+
+    try:
+        shutil.rmtree(path, onerror=remove_readonly)
+    except OSError:
+        return False
+    return not path.exists() and not cookies_path_for(userid).exists()
 
 
 def cookie_header(cookies: dict[str, str]) -> str:

@@ -88,9 +88,10 @@ class MultiMinerManager:
         if uid in self._miners:
             self._miners[uid].stop()
 
-    async def stop_account_and_wait(self, uid: str) -> None:
+    async def stop_account_and_wait(self, uid: str) -> bool:
         """Stop one account and wait until its network resources are closed."""
         await self._cleanup_uid(uid)
+        return uid not in self._miners and uid not in self._tasks
 
     def stop_all(self) -> None:
         for miner in self._miners.values():
@@ -101,11 +102,23 @@ class MultiMinerManager:
             self._miners[uid].stop()
         task = self._tasks.get(uid)
         if task and not task.done():
+            # A network request may be waiting for its full HTTP timeout. The
+            # account-level stop operation must not leave deletion waiting on
+            # that request; cancelling the miner task runs its normal finally
+            # cleanup and closes the account's bridge/session.
+            task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         if uid in self._miners:
             await self._miners[uid].__aexit__()
             self._miners.pop(uid, None)
             self._tasks.pop(uid, None)
+
+    async def force_refresh_account(self, uid: str) -> MinerState | None:
+        """Refresh one running account without rebuilding the manager."""
+        miner = self._miners.get(uid)
+        if miner is None:
+            return None
+        return await miner.force_refresh()
 
     async def wait(self) -> None:
         if self._tasks:
