@@ -33,7 +33,7 @@ from .channel import (
     missions_for_channel,
     pick_channel,
 )
-from .models import InventoryItem, LiveChannel, Mission
+from .models import DropEvent, InventoryItem, LiveChannel, Mission
 from .watch import HeartbeatStatus, WatchHeartbeat
 from .network import AccountNetworkContext, AccountSession
 
@@ -58,6 +58,7 @@ class MinerState:
     broad_no: str | None = None
     bridge_connected: bool = False
     missions: list[Mission] = field(default_factory=list)
+    events: list[DropEvent] = field(default_factory=list)
     inventory: list[InventoryItem] = field(default_factory=list)
     available_channels: list[LiveChannel] = field(default_factory=list)
     heartbeat_last_success: str | None = None
@@ -96,6 +97,7 @@ class SoopMiner:
         self._bridge: BridgeSession | None = None
         self._current: LiveChannel | None = None
         self._missions: list[Mission] = []
+        self._events: list[DropEvent] = []
         self._inventory: list[InventoryItem] = []
         self._available_channels: list[LiveChannel] = []
         self._stall_polls: dict[str, int] = {}
@@ -234,6 +236,7 @@ class SoopMiner:
             broad_no=self._current.broad_no if self._current else None,
             bridge_connected=self._bridge is not None and self._bridge.is_connected,
             missions=list(self._missions),
+            events=list(self._events),
             inventory=list(self._inventory),
             available_channels=list(self._available_channels),
             heartbeat_last_success=(
@@ -338,11 +341,7 @@ class SoopMiner:
 
         if not self._missions:
             if not self._empty_missions_logged:
-                progress_events: list = []
-                try:
-                    progress_events = await self._drops.get_progress_events()
-                except Exception:
-                    pass
+                progress_events = list(self._events)
                 self._log.warning(
                     self._drops.empty_missions_hint(
                         self.uid,
@@ -410,6 +409,14 @@ class SoopMiner:
         # the mission count stays constant.
         self._emit_state()
 
+    async def _fetch_events(self) -> None:
+        """拉取活动总览，覆盖尚未加入当前账号 mission 的新活动。"""
+        await self._ensure_session()
+        assert self._drops
+        self._events = await self._drops.get_progress_events()
+        self._log.info("SOOP activity catalog refreshed events=%d", len(self._events))
+        self._emit_state()
+
     async def _refresh_available_channels(self) -> None:
         """Refresh the live channel snapshot used by the Worker/UI."""
         await self._ensure_session()
@@ -431,6 +438,7 @@ class SoopMiner:
         async with self._refresh_lock:
             previous = (
                 self._missions,
+                self._events,
                 self._inventory,
                 self._available_channels,
                 self._current,
@@ -441,18 +449,26 @@ class SoopMiner:
                 if not self._running and self._drops is not None:
                     await self._drops.ensure_drops_ready(on_info=self._log.info)
                 await self._refresh_missions()
+                await self._fetch_events()
                 await self._refresh_inventory()
                 await self._refresh_available_channels()
             except Exception:
-                self._missions, self._inventory, self._available_channels, self._current = previous
+                (
+                    self._missions,
+                    self._events,
+                    self._inventory,
+                    self._available_channels,
+                    self._current,
+                ) = previous
                 self._emit_state()
                 raise
 
             state = self.get_state()
             active = sum(1 for mission in state.missions if mission.is_event_active)
             self._log.info(
-                "SOOP mission refresh completed missions=%d active=%d channels=%d",
+                "SOOP mission refresh completed missions=%d events=%d active=%d channels=%d",
                 len(state.missions),
+                len(state.events),
                 active,
                 len(state.available_channels),
             )
@@ -659,6 +675,7 @@ class SoopMiner:
                 try:
                     async with self._refresh_lock:
                         await self._fetch_missions()
+                        await self._fetch_events()
                 except asyncio.CancelledError:
                     raise
                 except DropsAuthenticationError as exc:
@@ -740,6 +757,12 @@ class SoopMiner:
             if self._session:
                 await self._drops.ensure_drops_ready(on_info=self._log.info)
             await self._refresh_missions(channel_first=True)
+            try:
+                await self._fetch_events()
+            except DropsAuthenticationError:
+                raise
+            except Exception as exc:
+                self._log.warning("加载活动目录失败，稍后按任务刷新间隔重试: %s", exc)
         except DropsAuthenticationError as exc:
             self._handle_auth_expired(exc)
             return

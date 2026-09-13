@@ -5,6 +5,17 @@ from datetime import datetime, timedelta
 from typing import Any
 
 
+def api_bool(value: Any) -> bool:
+    """Parse SOOP's mixed boolean encodings without treating ``\"N\"`` as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 def parse_mission_datetime(value: str) -> datetime | None:
     """解析任务 API 返回的日期时间字符串。"""
     text = (value or "").strip()
@@ -153,7 +164,7 @@ class Mission:
                 user_id=str(ch.get("userId", "")),
                 user_nick=str(ch.get("userNick", "")),
                 broad_no=str(ch["broadNo"]) if ch.get("broadNo") else None,
-                on_air=bool(ch.get("onAir")),
+                on_air=api_bool(ch.get("onAir")),
             )
             for ch in data.get("broadIdList") or []
         ]
@@ -163,7 +174,7 @@ class Mission:
                 give_term=int(it.get("giveTerm") or 0),
                 view_time=int(it.get("viewTime") or 0),
                 percent=int(it.get("percent") or 0),
-                mission_success=bool(it.get("missionSuccess")),
+                mission_success=api_bool(it.get("missionSuccess")),
                 raw=it,
             )
             for it in data.get("itemList") or []
@@ -175,7 +186,7 @@ class Mission:
             start_date=str(data.get("startDate", "")),
             end_date=str(data.get("endDate", "")),
             ingame_give=str(data.get("ingameGiveYn", "")).upper() == "Y",
-            live=bool(data.get("live")),
+            live=api_bool(data.get("live")),
             give_con=str(data.get("giveCon") or ""),
             drops_type=str(data.get("dropsType") or ""),
             filter=str(data.get("filter") or ""),
@@ -218,9 +229,9 @@ class DropEvent:
             title=str(data.get("title", "")),
             filter=str(data.get("filter") or ""),
             give_con=str(data.get("giveCon") or ""),
-            dup_flag=str(data.get("dupFlag", "")).upper() == "Y",
-            live=bool(data.get("live")),
-            acct_conn=bool(data.get("acctConn")),
+            dup_flag=api_bool(data.get("dupFlag")),
+            live=api_bool(data.get("live")),
+            acct_conn=api_bool(data.get("acctConn")),
             start_date=str(data.get("startDate", "")),
             end_date=str(data.get("endDate", "")),
             raw=data,
@@ -257,6 +268,34 @@ class DropEvent:
         if self.is_random:
             return "随机"
         return "掉宝"
+
+    @property
+    def is_event_active(self) -> bool:
+        """活动目录中当前进行中的 Drops。"""
+        if self.filter != "progress" or not self.live:
+            return False
+        end_at = parse_mission_datetime(self.end_date)
+        if end_at is None:
+            return True
+        if len((self.end_date or "").strip()) <= 10:
+            end_at += timedelta(days=1)
+        return datetime.now() < end_at
+
+    @property
+    def is_not_yet_open(self) -> bool:
+        if self.is_event_active:
+            return False
+        start_at = parse_mission_datetime(self.start_date)
+        return start_at is not None and datetime.now() < start_at
+
+    @property
+    def is_truly_ended(self) -> bool:
+        end_at = parse_mission_datetime(self.end_date)
+        if end_at is None:
+            return not self.is_event_active and not self.is_not_yet_open
+        if len((self.end_date or "").strip()) <= 10:
+            end_at += timedelta(days=1)
+        return datetime.now() >= end_at
 
     def matches_channel(self, channel: LiveChannel) -> bool:
         for row in self.raw.get("broadIdList") or []:
