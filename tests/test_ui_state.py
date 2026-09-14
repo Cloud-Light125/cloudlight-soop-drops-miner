@@ -80,6 +80,17 @@ def test_new_and_deleted_mission_are_key_local() -> None:
     assert diff_registry(two, one).removed == (("A", "m2"),)
 
 
+def test_completed_mission_keeps_history_card_after_event_end() -> None:
+    completed = mission("done")
+    completed.end_date = "2020-01-01"
+    completed.items[0].mission_success = True
+
+    state = mission_ui_states("A", [completed])[("A", "done")]
+
+    assert state.status == "已完成"
+    assert state.ended
+
+
 def test_tier_progress_only_changes_progress_fields() -> None:
     before = mission_ui_states("A", [mission(percent=10, minutes=5)])[("A", "m1")].tiers[0]
     after = mission_ui_states("A", [mission(percent=20, minutes=10)])[("A", "m1")].tiers[0]

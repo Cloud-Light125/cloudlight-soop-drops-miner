@@ -105,6 +105,7 @@ class SoopMiner:
         self._stop = asyncio.Event()
         self._running = False
         self._ended_logged: set[str] = set()
+        self._completed_logged: set[str] = set()
         self._empty_missions_logged = False
         self._had_missions = False
         self._last_network_recover = 0.0
@@ -174,7 +175,7 @@ class SoopMiner:
             "已连接" if bridge_ok else "未连接",
             cate_hint,
         )
-        if mission.is_event_ended or mission.is_truly_ended:
+        if mission.is_truly_ended:
             self._log.warning("  ↳ 该任务已结束，进度不会再增加")
         elif mission.is_lottery and ch and not channel_matches_mission_category(mission, ch):
             self._log.warning("  ↳ 抽奖型需挂「%s」分类的 #드롭스 直播间", mission.category_name or mission.category_no)
@@ -293,36 +294,34 @@ class SoopMiner:
 
     def _log_progress(self) -> None:
         for mission in self._missions:
-            if not mission.items:
+            if not mission.items or mission.completed:
                 continue
             tag = mission.type_label
             active = mission.active_item()
             if active is None:
-                self._log.info("[%s] %s 全部档位已完成", tag, mission.title)
                 continue
-            self._log.info("[%s] %s 累计观看 %d 分钟", tag, mission.title, active.view_time)
+            self._log.info(
+                "[%s] %s 当前奖励 %s %s: %d/%d 分钟 (%d%%)",
+                tag,
+                mission.title,
+                active.term_label,
+                active.item_name,
+                active.view_time,
+                active.give_term,
+                active.percent,
+            )
             active_idx = mission.items.index(active)
             for i, item in enumerate(mission.items):
-                if item.mission_success:
-                    self._log.info("  %s %s: 已完成", item.term_label, item.item_name)
-                elif i == active_idx:
-                    self._log.info(
-                        "  %s %s: %d/%d 分钟 (%d%%) ← 当前",
-                        item.term_label,
-                        item.item_name,
-                        item.view_time,
-                        item.give_term,
-                        item.percent,
-                    )
-                else:
-                    self._log.info(
-                        "  %s %s: %d/%d 分钟 (%d%%)",
-                        item.term_label,
-                        item.item_name,
-                        item.view_time,
-                        item.give_term,
-                        item.percent,
-                    )
+                if item.mission_success or i == active_idx:
+                    continue
+                self._log.debug(
+                    "  %s %s: %d/%d 分钟 (%d%%)",
+                    item.term_label,
+                    item.item_name,
+                    item.view_time,
+                    item.give_term,
+                    item.percent,
+                )
 
     async def _fetch_missions(self) -> None:
         """拉取 mission 列表并记录进度（不选台）。"""
@@ -330,6 +329,7 @@ class SoopMiner:
         assert self._drops
         prev_times: dict[str, int] = {}
         prev_count = len(self._missions)
+        previous_completion = {mission.drops_idx: mission.completed for mission in self._missions}
         for m in self._missions:
             item = m.active_item()
             if item:
@@ -338,6 +338,16 @@ class SoopMiner:
         self._missions = await self._drops.get_missions()
         self._available_channels = collect_mission_channels(self._missions)
         new_count = len(self._missions)
+
+        for mission in self._missions:
+            if mission.completed:
+                if previous_completion.get(mission.drops_idx) is False and mission.drops_idx not in self._completed_logged:
+                    self._log.info("任务完成：%s", mission.title)
+                    self._completed_logged.add(mission.drops_idx)
+            else:
+                # If SOOP reopens/rebuilds a mission with fresh incomplete
+                # tiers, allow a later completion transition to be logged.
+                self._completed_logged.discard(mission.drops_idx)
 
         if not self._missions:
             if not self._empty_missions_logged:
@@ -360,21 +370,23 @@ class SoopMiner:
             self._had_missions = True
 
             for mission in self._missions:
-                if mission.is_event_ended and mission.drops_idx not in self._ended_logged:
-                    if mission.is_not_yet_open:
-                        self._log.warning(
-                            "[%s] %s 当前未开放掉宝（截止 %s）",
-                            mission.type_label,
-                            mission.title,
-                            mission.end_date or "?",
-                        )
-                    else:
-                        self._log.warning(
-                            "[%s] %s 活动已结束（截止 %s），继续挂机不会累计该任务进度",
-                            mission.type_label,
-                            mission.title,
-                            mission.end_date or "?",
-                        )
+                if mission.completed or mission.drops_idx in self._ended_logged:
+                    continue
+                if mission.is_not_yet_open:
+                    self._log.warning(
+                        "[%s] %s 当前未开放掉宝（截止 %s）",
+                        mission.type_label,
+                        mission.title,
+                        mission.end_date or "?",
+                    )
+                    self._ended_logged.add(mission.drops_idx)
+                elif mission.is_truly_ended:
+                    self._log.warning(
+                        "[%s] %s 活动已结束（截止 %s），继续挂机不会累计该任务进度",
+                        mission.type_label,
+                        mission.title,
+                        mission.end_date or "?",
+                    )
                     self._ended_logged.add(mission.drops_idx)
 
             self._log_progress()
@@ -484,6 +496,17 @@ class SoopMiner:
                 "manual": "手动选台",
                 "owesports": f"仅 {self._channel_config.preferred_bjid}",
             }.get(self._channel_config.mode, "")
+            if (
+                self._channel_config.mode == "smart"
+                and not self._channel_config.hang_without_missions
+                and self._current is not None
+                and not active_progress_missions(self._missions)
+            ):
+                if self._bridge:
+                    await self._bridge.close()
+                    self._bridge = None
+                self._current = None
+                self._heartbeat = None
             if self._current is None:
                 self._log.warning("没有可用的 Drops 直播间（%s），等待中...", mode_hint)
             self._emit_state("等待直播间")

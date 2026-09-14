@@ -938,7 +938,10 @@ class ModernSoopGui:
                 existing[(state.uid, item.item_code_idx)] = (state.uid, item)
             self._set_inventory(list(existing.values()))
         if self._selected_uid == state.uid:
-            self._cached_missions = [mission for mission in state.missions if mission.is_event_active]
+            self._cached_missions = [
+                mission for mission in state.missions
+                if mission.is_event_active and not mission.completed
+            ]
             if state.available_channels:
                 self._cached_channels = list(state.available_channels)
                 self._channels_loaded = True
@@ -981,7 +984,10 @@ class ModernSoopGui:
             for row_uid, row in self._account_rows.items():
                 row.set_selected(row_uid == uid)
         state = self._states.get(uid) if uid else None
-        self._cached_missions = [mission for mission in state.missions if mission.is_event_active] if state else []
+        self._cached_missions = [
+            mission for mission in state.missions
+            if mission.is_event_active and not mission.completed
+        ] if state else []
         if state is not None:
             self._cached_channels = list(state.available_channels)
             self._channels_loaded = bool(self._cached_channels)
@@ -1019,7 +1025,7 @@ class ModernSoopGui:
             return
         self._detail_hint.grid_remove()
         self._detail_grid.grid()
-        mission = next((item for item in state.missions if item.is_event_active), None)
+        mission = next((item for item in state.missions if item.is_event_active and not item.completed), None)
         source = "—"
         miner = self._manager.get_miner(state.uid) if self._manager else None
         if miner is not None:

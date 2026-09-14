@@ -141,7 +141,7 @@ def _mission_progress(mission: Mission) -> tuple[int, int]:
 
 
 def account_ui_state(state: MinerState) -> AccountUiState:
-    mission = next((item for item in state.missions if item.is_event_active), None)
+    mission = next((item for item in state.missions if item.is_event_active and not item.completed), None)
     current, percent = _mission_progress(mission) if mission else (0, 0)
     heartbeat = friendly_watch_status(state)
     return AccountUiState(
@@ -205,7 +205,9 @@ def friendly_watch_status(state: MinerState) -> str:
 def mission_ui_states(uid: str, missions: Iterable[Mission], channel_name: str = "") -> dict[tuple[str, str], MissionUiState]:
     result: dict[tuple[str, str], MissionUiState] = {}
     for mission in missions:
-        if not mission.is_event_active:
+        # Completed rewards remain useful history even after the event window
+        # closes; execution candidates are filtered separately in channel.py.
+        if not mission.is_event_active and not mission.completed:
             continue
         mission_key = (uid, mission.drops_idx)
         current, _ = _mission_progress(mission)
@@ -229,7 +231,9 @@ def mission_ui_states(uid: str, missions: Iterable[Mission], channel_name: str =
         )
         needs_switch = bool(channel_name) and bool(mission.channels) and not channel_matches
         status = (
-            "尚未开始"
+            "已完成"
+            if mission.completed
+            else "尚未开始"
             if not_started
             else "已结束"
             if ended

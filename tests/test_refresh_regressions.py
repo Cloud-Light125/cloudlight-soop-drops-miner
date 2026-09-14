@@ -1,15 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
+import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 from soop_miner import auth
-from soop_miner.channel import filter_missions_by_priority
+from soop_miner.channel import (
+    active_progress_missions,
+    collect_mission_channel_candidates,
+    filter_missions_by_priority,
+    is_actionable_task,
+    missions_for_channel,
+    selectable_missions,
+)
 from soop_miner.config import AppConfig
 from soop_miner.miner import SoopMiner
-from soop_miner.models import DropEvent, DropItem, LiveChannel, Mission
+from soop_miner.models import (
+    SOOP_TIMEZONE,
+    DropEvent,
+    DropItem,
+    LiveChannel,
+    Mission,
+    TaskLifecycleState,
+    parse_mission_datetime,
+)
 
 
 def _mission(idx: str, *, active: bool = True) -> Mission:
@@ -239,6 +256,131 @@ def test_event_catalog_parses_active_activity_and_mixed_boolean_fields() -> None
     )
     assert not mission.is_event_active
     assert not mission.items[0].mission_success
+
+
+def _lifecycle_api_row(
+    idx: str,
+    *,
+    start: str = "2026-09-14 00:30:00",
+    end: str = "2026-09-14 23:30:00",
+    live: str = "N",
+    item_success: list[str] | None = None,
+    channels: bool = True,
+) -> dict:
+    successes = item_success or ["N"]
+    return {
+        "dropsIdx": idx,
+        "title": f"OWWC FINALS 인게임 아이템 드롭스 DAY {idx}",
+        "filter": "progress",
+        "live": live,
+        "giveCon": "term",
+        "startDate": start,
+        "endDate": end,
+        "broadIdList": (
+            [{"userId": "owesports", "userNick": "OW Esports", "broadNo": "1", "onAir": "Y"}]
+            if channels else []
+        ),
+        "itemList": [
+            {
+                "itemName": f"{index + 1}h reward",
+                "giveTerm": (index + 1) * 60,
+                "viewTime": (index + 1) * 60 if success == "Y" else 10,
+                "percent": 100 if success == "Y" else 16,
+                "missionSuccess": success,
+            }
+            for index, success in enumerate(successes)
+        ],
+    }
+
+
+def test_soop_kst_activity_window_ignores_catalog_live_flag() -> None:
+    now_shanghai = datetime(2026, 9, 14, 10, 7, tzinfo=timezone(timedelta(hours=8)))
+    active = DropEvent.from_api(_lifecycle_api_row("2"))
+    mission = Mission.from_api(_lifecycle_api_row("2"))
+    upcoming_now = datetime(2026, 9, 13, 23, 0, tzinfo=SOOP_TIMEZONE)
+    ended_now = datetime(2026, 9, 15, 0, 0, tzinfo=SOOP_TIMEZONE)
+
+    parsed = parse_mission_datetime("2026-09-14 00:30:00")
+    assert parsed is not None and parsed.utcoffset() == timedelta(hours=9)
+
+    for row in (active, mission):
+        assert row.event_lifecycle_state_at(now_shanghai) is TaskLifecycleState.ACTIVE
+        assert row.is_event_active_at(now_shanghai)
+        assert not row.is_not_yet_open_at(now_shanghai)
+        assert not row.is_truly_ended_at(now_shanghai)
+        assert row.event_lifecycle_state_at(upcoming_now) is TaskLifecycleState.UPCOMING
+        assert row.is_not_yet_open_at(upcoming_now)
+        assert row.event_lifecycle_state_at(ended_now) is TaskLifecycleState.ENDED
+        assert row.is_truly_ended_at(ended_now)
+
+
+def test_completed_mission_is_displayable_but_not_an_actionable_candidate() -> None:
+    now = datetime(2026, 9, 14, 11, 7, tzinfo=SOOP_TIMEZONE)
+    completed = Mission.from_api(_lifecycle_api_row("2", item_success=["Y"] * 10))
+    partial = Mission.from_api(_lifecycle_api_row("partial", item_success=["Y"] * 9 + ["N"]))
+
+    assert completed.completed
+    assert len(completed.items) == 10
+    assert completed.lifecycle_state_at(now) is TaskLifecycleState.COMPLETED
+    assert completed.is_event_active_at(now)
+    assert not is_actionable_task(completed, now=now)
+    assert completed not in active_progress_missions([completed, partial], now=now)
+    assert completed not in missions_for_channel([completed, partial], partial.channels[0], now=now)
+    assert collect_mission_channel_candidates([completed]) == []
+
+    assert not partial.completed
+    assert partial.lifecycle_state_at(now) is TaskLifecycleState.ACTIVE
+    assert is_actionable_task(partial, now=now)
+    assert partial in active_progress_missions([completed, partial], now=now)
+    assert partial in missions_for_channel([completed, partial], partial.channels[0], now=now)
+    assert filter_missions_by_priority([completed, partial], "auto", now=now) == [partial]
+
+
+def test_upcoming_incomplete_mission_is_selectable_but_not_an_auto_candidate() -> None:
+    now = datetime(2026, 9, 14, 11, 7, tzinfo=SOOP_TIMEZONE)
+    upcoming = Mission.from_api(
+        _lifecycle_api_row(
+            "upcoming",
+            start="2026-09-15 00:30:00",
+            end="2026-09-15 23:30:00",
+            live="N",
+        )
+    )
+    active = Mission.from_api(
+        _lifecycle_api_row(
+            "active",
+            start="2026-09-14 00:30:00",
+            end="2099-09-15 23:30:00",
+            live="N",
+        )
+    )
+
+    assert selectable_missions([upcoming, active], now=now) == [upcoming, active]
+    assert is_actionable_task(upcoming, allow_upcoming=True, now=now)
+    assert not is_actionable_task(upcoming, now=now)
+    # The real execution selector remains active-only, so an upcoming
+    # priority cannot make the miner pick a future mission.
+    assert filter_missions_by_priority([upcoming, active], "upcoming", now=now) == [active]
+
+
+def test_progress_log_skips_completed_tiers_and_logs_completion_transition_once(caplog) -> None:
+    async def scenario() -> None:
+        incomplete = Mission.from_api(_lifecycle_api_row("done", item_success=["N", "Y"]))
+        completed = Mission.from_api(_lifecycle_api_row("done", item_success=["Y", "Y"]))
+        miner = SoopMiner({"BbsTicket": "account"}, app_config=AppConfig())
+        miner._running = True
+        miner._session = SimpleNamespace(closed=False)
+        miner._drops = _SequenceDrops([[incomplete], [completed]])
+        await miner._fetch_missions()
+        await miner._fetch_missions()
+
+    caplog.set_level(logging.INFO, logger="SoopDropsMiner")
+    asyncio.run(scenario())
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("任务完成：" in message for message in messages) == 1
+    assert not any("全部档位已完成" in message for message in messages)
+    assert not any("1h reward: 已完成" in message for message in messages)
+    assert any("当前奖励" in message for message in messages)
 
 
 def test_legacy_cookie_migration_does_not_recreate_deleted_account() -> None:

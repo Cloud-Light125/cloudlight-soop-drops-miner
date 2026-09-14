@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import asyncio
@@ -40,6 +41,37 @@ PRIORITY_MISSION_AUTO = "auto"
 ONE_STREAM_NOTICE = (
     "每个账号同一时间只能进入一个直播间。只有符合掉宝活动要求的直播间，才会累计对应任务的观看进度。"
 )
+
+
+def is_actionable_task(
+    mission: Mission,
+    *,
+    allow_upcoming: bool = False,
+    now: datetime | None = None,
+) -> bool:
+    """Shared task policy for selection and progress paths.
+
+    ``allow_upcoming`` is used only by settings/UI selection.  The miner's
+    execution candidates remain active-only, while both paths exclude ended
+    and fully completed missions.
+    """
+    if mission.completed or mission.is_truly_ended_at(now):
+        return False
+    if mission.is_event_active_at(now):
+        return True
+    return allow_upcoming and mission.is_not_yet_open_at(now)
+
+
+def selectable_missions(
+    missions: list[Mission],
+    *,
+    now: datetime | None = None,
+) -> list[Mission]:
+    """Missions that may be saved as a priority, including upcoming ones."""
+    return [
+        mission for mission in missions
+        if is_actionable_task(mission, allow_upcoming=True, now=now)
+    ]
 
 
 def parse_stream_input(text: str) -> tuple[str, str | None]:
@@ -104,6 +136,8 @@ def collect_mission_channel_candidates(missions: list[Mission]) -> list[LiveChan
     seen: set[str] = set()
     result: list[LiveChannel] = []
     for mission in missions:
+        if not is_actionable_task(mission):
+            continue
         for ch in mission.channels:
             if not ch.user_id or ch.user_id in seen:
                 continue
@@ -125,7 +159,7 @@ def fixed_category_channels(
     mission: Mission,
     hashtag_live: list[LiveChannel],
 ) -> list[LiveChannel]:
-    if not is_category_fixed_mission(mission):
+    if not is_actionable_task(mission) or not is_category_fixed_mission(mission):
         return []
     eligible = _lottery_eligible_channels(hashtag_live)
     return [ch for ch in eligible if channel_matches_mission_category(mission, ch)]
@@ -136,7 +170,7 @@ def has_fixed_category_live(
     hashtag_live: list[LiveChannel],
 ) -> bool:
     for mission in missions:
-        if not mission.is_event_active or not mission.is_fixed:
+        if not is_actionable_task(mission) or not mission.is_fixed:
             continue
         if fixed_category_channels(mission, hashtag_live):
             return True
@@ -156,19 +190,19 @@ def fixed_official_ids(missions: list[Mission]) -> set[str]:
 
 
 def has_active_fixed_missions(missions: list[Mission]) -> bool:
-    return any(m.is_fixed and m.is_event_active and m.items for m in missions)
+    return any(is_actionable_task(m) and m.is_fixed and m.items for m in missions)
 
 
 def has_active_lottery_missions(missions: list[Mission]) -> bool:
-    return any(m.is_lottery and m.is_event_active and m.items for m in missions)
+    return any(is_actionable_task(m) and m.is_lottery and m.items for m in missions)
 
 
 def ended_fixed_missions(missions: list[Mission]) -> list[Mission]:
-    return [m for m in missions if m.is_fixed and m.is_event_ended and m.items]
+    return [m for m in missions if m.is_fixed and m.is_truly_ended and m.items]
 
 
 def ended_lottery_missions(missions: list[Mission]) -> list[Mission]:
-    return [m for m in missions if m.is_lottery and m.is_event_ended and m.items]
+    return [m for m in missions if m.is_lottery and m.is_truly_ended and m.items]
 
 
 def _fixed_missions(missions: list[Mission]) -> list[Mission]:
@@ -181,17 +215,15 @@ def fixed_column_summary(missions: list[Mission]) -> tuple[str, str]:
     if not fixed:
         return "暂无固定型任务", "#757575"
     active = [m for m in fixed if m.is_event_active]
-    inactive = [m for m in fixed if m.is_event_ended]
+    upcoming = [m for m in fixed if m.is_not_yet_open]
+    ended = [m for m in fixed if m.is_truly_ended]
     parts: list[str] = []
     if active:
         parts.append(f"进行中 {len(active)} 个")
-    if inactive:
-        not_open = sum(1 for m in inactive if m.is_not_yet_open)
-        ended = sum(1 for m in inactive if m.is_truly_ended)
-        if not_open:
-            parts.append(f"未开放 {not_open} 个")
-        if ended:
-            parts.append(f"已结束 {ended} 个")
+    if upcoming:
+        parts.append(f"未开放 {len(upcoming)} 个")
+    if ended:
+        parts.append(f"已结束 {len(ended)} 个")
     color = "#2e7d32" if active else "#757575"
     return " · ".join(parts), color
 
@@ -207,13 +239,14 @@ def fixed_column_warning(
     if not fixed:
         return ""
 
-    active = [m for m in fixed if m.is_event_active]
-    inactive = [m for m in fixed if m.is_event_ended]
+    active = [m for m in fixed if is_actionable_task(m)]
+    upcoming = [m for m in fixed if m.is_not_yet_open]
+    ended = [m for m in fixed if m.is_truly_ended]
 
     if not active:
-        if any(m.is_not_yet_open for m in inactive):
+        if upcoming:
             return "⚠ 当前未开放掉宝"
-        if inactive:
+        if ended:
             return "⚠ 固定型活动已结束，继续挂机不会累计该任务进度"
         return ""
 
@@ -237,7 +270,7 @@ def is_fixed_progress_available(
 ) -> bool:
     """固定型是否有官方频道在线（可累计进度）。"""
     if not has_active_fixed_missions(missions):
-        inactive = [m for m in missions if m.is_fixed and m.is_event_ended and m.items]
+        inactive = [m for m in missions if m.is_fixed and m.is_truly_ended and m.items]
         if inactive:
             return False
         return True
@@ -305,7 +338,7 @@ def lottery_missions_missing_live(
     """返回没有对应分类在线直播的抽奖型任务。"""
     missing: list[Mission] = []
     for mission in missions:
-        if not mission.is_lottery or not mission.is_event_active or not mission.items:
+        if not is_actionable_task(mission) or not mission.is_lottery or not mission.items:
             continue
         if not is_lottery_mission_live_available(mission, hashtag_live):
             missing.append(mission)
@@ -317,7 +350,7 @@ def collect_mission_channels(missions: list[Mission]) -> list[LiveChannel]:
     seen: set[str] = set()
     result: list[LiveChannel] = []
     for mission in missions:
-        if not mission.is_event_active:
+        if not is_actionable_task(mission):
             continue
         for ch in mission.online_channels():
             if ch.user_id in seen:
@@ -327,11 +360,15 @@ def collect_mission_channels(missions: list[Mission]) -> list[LiveChannel]:
     return result
 
 
-def active_progress_missions(missions: list[Mission]) -> list[Mission]:
+def active_progress_missions(
+    missions: list[Mission],
+    *,
+    now: datetime | None = None,
+) -> list[Mission]:
     """仍有未完成档位的进行中任务。"""
     result: list[Mission] = []
     for mission in missions:
-        if not mission.is_event_active or not mission.items:
+        if not is_actionable_task(mission, now=now) or not mission.items:
             continue
         item = mission.active_item()
         if item is None or item.mission_success or item.view_time >= item.give_term:
@@ -340,9 +377,14 @@ def active_progress_missions(missions: list[Mission]) -> list[Mission]:
     return result
 
 
-def mission_progresses_on_channel(mission: Mission, channel: LiveChannel | None) -> bool:
+def mission_progresses_on_channel(
+    mission: Mission,
+    channel: LiveChannel | None,
+    *,
+    now: datetime | None = None,
+) -> bool:
     """当前直播间是否能为该任务累计进度。"""
-    if channel is None or not mission.is_event_active:
+    if channel is None or not is_actionable_task(mission, now=now):
         return False
     if mission.is_fixed:
         official = fixed_official_ids([mission])
@@ -369,7 +411,7 @@ def channel_drops_type_tags(
     tags: list[str] = []
     seen: set[str] = set()
     for mission in missions:
-        if not mission.is_event_active:
+        if not is_actionable_task(mission):
             continue
         matched = mission_progresses_on_channel(mission, channel)
         if not matched and mission.is_lottery:
@@ -405,8 +447,16 @@ def format_channel_drops_label(
     return "/".join(tags)
 
 
-def missions_for_channel(missions: list[Mission], channel: LiveChannel | None) -> list[Mission]:
-    return [m for m in active_progress_missions(missions) if mission_progresses_on_channel(m, channel)]
+def missions_for_channel(
+    missions: list[Mission],
+    channel: LiveChannel | None,
+    *,
+    now: datetime | None = None,
+) -> list[Mission]:
+    return [
+        m for m in active_progress_missions(missions, now=now)
+        if mission_progresses_on_channel(m, channel, now=now)
+    ]
 
 
 def mission_pick_label(mission: Mission) -> str:
@@ -419,8 +469,10 @@ def mission_pick_label(mission: Mission) -> str:
 def filter_missions_by_priority(
     missions: list[Mission],
     priority_mission_id: str,
+    *,
+    now: datetime | None = None,
 ) -> list[Mission]:
-    active = active_progress_missions(missions)
+    active = active_progress_missions(missions, now=now)
     if not priority_mission_id or priority_mission_id == PRIORITY_MISSION_AUTO:
         return active
     selected = [m for m in active if m.drops_idx == priority_mission_id]

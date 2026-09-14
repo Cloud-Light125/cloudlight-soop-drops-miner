@@ -1,8 +1,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+import math
+import re
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+try:
+    SOOP_TIMEZONE = ZoneInfo("Asia/Seoul")
+except ZoneInfoNotFoundError:  # pragma: no cover - only minimal Python images lack tzdata
+    # KST has no daylight-saving transitions.  This fallback preserves the
+    # same explicit wire-time semantics when the host has no IANA tz database.
+    SOOP_TIMEZONE = timezone(timedelta(hours=9), "Asia/Seoul")
+
+
+class TaskLifecycleState(str, Enum):
+    """The account-facing lifecycle of a Drops task."""
+
+    UPCOMING = "upcoming"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    ENDED = "ended"
+    UNKNOWN = "unknown"
 
 
 def api_bool(value: Any) -> bool:
@@ -16,21 +38,115 @@ def api_bool(value: Any) -> bool:
     return bool(value)
 
 
-def parse_mission_datetime(value: str) -> datetime | None:
-    """解析任务 API 返回的日期时间字符串。"""
-    text = (value or "").strip()
-    if not text:
+def _as_soop_now(value: datetime | None = None) -> datetime:
+    """Normalize a comparison instant to an aware Asia/Seoul datetime."""
+    if value is None:
+        return datetime.now(SOOP_TIMEZONE)
+    if value.tzinfo is None:
+        # A naive fixture is explicitly a SOOP/KST wall-clock value.  It is
+        # never interpreted using the machine's local timezone.
+        return value.replace(tzinfo=SOOP_TIMEZONE)
+    return value.astimezone(SOOP_TIMEZONE)
+
+
+def _aware_soop_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=SOOP_TIMEZONE)
+    return value.astimezone(SOOP_TIMEZONE)
+
+
+def _unix_timestamp(value: float) -> datetime | None:
+    if not math.isfinite(value):
         return None
-    for fmt, size in (
-        ("%Y-%m-%d %H:%M:%S", 19),
-        ("%Y-%m-%d %H:%M", 16),
-        ("%Y-%m-%d", 10),
-    ):
-        try:
-            return datetime.strptime(text[:size], fmt)
-        except ValueError:
-            continue
-    return None
+    # SOOP has used both seconds and millisecond timestamps in surrounding
+    # APIs.  The unit is determined from the magnitude, not from a timezone
+    # offset or a host-local conversion.
+    seconds = value / 1000 if abs(value) >= 100_000_000_000 else value
+    try:
+        return datetime.fromtimestamp(seconds, timezone.utc).astimezone(SOOP_TIMEZONE)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def parse_mission_datetime(value: Any) -> datetime | None:
+    """Parse a SOOP date/time value into an aware Asia/Seoul datetime.
+
+    Current SOOP responses use ``YYYY-MM-DD HH:mm:ss`` without an offset and
+    those strings mean KST.  The parser also accepts ISO-8601 values with an
+    explicit offset and Unix timestamps so all supported wire forms retain a
+    single, documented comparison semantic.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        return _aware_soop_datetime(value)
+    if isinstance(value, (int, float)):
+        return _unix_timestamp(float(value))
+
+    text = str(value).strip()
+    if not text or text.casefold() in {"none", "null"}:
+        return None
+    if re.fullmatch(r"[+-]?\d{9,17}(?:\.\d+)?", text):
+        return _unix_timestamp(float(text))
+
+    normalized = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        parsed = None
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%Y/%m/%d",
+            "%Y.%m.%d",
+        ):
+            try:
+                parsed = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+    return _aware_soop_datetime(parsed) if parsed is not None else None
+
+
+def _is_date_only(value: Any) -> bool:
+    return bool(re.fullmatch(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}", str(value or "").strip()))
+
+
+def _end_boundary(value: Any, parsed: datetime) -> datetime:
+    # Existing SOOP date-only responses represent the whole calendar day.
+    return parsed + timedelta(days=1) if _is_date_only(value) else parsed
+
+
+def event_lifecycle_state_at(
+    start_date: Any,
+    end_date: Any,
+    *,
+    filter_value: Any = "",
+    live: Any = False,
+    now: datetime | None = None,
+) -> TaskLifecycleState:
+    """Return the activity-window state using SOOP/KST time semantics."""
+    current = _as_soop_now(now)
+    start_at = parse_mission_datetime(start_date)
+    end_at = parse_mission_datetime(end_date)
+    if end_at is not None and current >= _end_boundary(end_date, end_at):
+        return TaskLifecycleState.ENDED
+    if start_at is not None and current < start_at:
+        return TaskLifecycleState.UPCOMING
+    if start_at is not None or end_at is not None:
+        return TaskLifecycleState.ACTIVE
+
+    # With no usable dates, retain a conservative fallback for legacy rows.
+    # ``live`` is not consulted when a date window is present: the activity
+    # catalog's live flag is not the official lifecycle indicator.
+    if str(filter_value or "").strip().casefold() == "progress" and api_bool(live):
+        return TaskLifecycleState.ACTIVE
+    return TaskLifecycleState.UNKNOWN
+
+
+def _api_date_text(value: Any) -> str:
+    return "" if value is None else str(value)
 
 
 def format_watch_term(minutes: int) -> str:
@@ -121,41 +237,64 @@ class Mission:
         return "掉宝"
 
     @property
+    def completed(self) -> bool:
+        """Whether every reward tier has been completed for this account."""
+        return bool(self.items) and all(item.mission_success for item in self.items)
+
+    @property
+    def is_completed(self) -> bool:
+        """Compatibility/readability alias for the structured completion state."""
+        return self.completed
+
+    def event_lifecycle_state_at(self, now: datetime | None = None) -> TaskLifecycleState:
+        return event_lifecycle_state_at(
+            self.start_date,
+            self.end_date,
+            filter_value=self.filter,
+            live=self.live,
+            now=now,
+        )
+
+    def lifecycle_state_at(self, now: datetime | None = None) -> TaskLifecycleState:
+        if self.completed:
+            return TaskLifecycleState.COMPLETED
+        return self.event_lifecycle_state_at(now)
+
+    @property
+    def lifecycle_state(self) -> TaskLifecycleState:
+        return self.lifecycle_state_at()
+
+    def is_event_active_at(self, now: datetime | None = None) -> bool:
+        return self.event_lifecycle_state_at(now) is TaskLifecycleState.ACTIVE
+
+    def is_event_ended_at(self, now: datetime | None = None) -> bool:
+        return self.event_lifecycle_state_at(now) is TaskLifecycleState.ENDED
+
+    def is_not_yet_open_at(self, now: datetime | None = None) -> bool:
+        return self.event_lifecycle_state_at(now) is TaskLifecycleState.UPCOMING
+
+    @property
     def is_event_active(self) -> bool:
-        """活动进行中（与官网 mission 页「进行中」一致）。"""
-        if self.filter != "progress" or not self.live:
-            return False
-        end_at = parse_mission_datetime(self.end_date)
-        if end_at is None:
-            return True
-        if len((self.end_date or "").strip()) <= 10:
-            end_at += timedelta(days=1)
-        return datetime.now() < end_at
+        """活动进行中；状态由时间窗口决定，不由 activity ``live`` 字段决定。"""
+        return self.is_event_active_at()
 
     @property
     def is_event_ended(self) -> bool:
         """活动已结束（官网显示在已结束区域）。"""
-        return not self.is_event_active
+        return self.is_event_ended_at()
 
     @property
     def is_not_yet_open(self) -> bool:
-        """官网标记非进行中，且当前时间早于开始时间。"""
-        if self.is_event_active:
-            return False
-        start_at = parse_mission_datetime(self.start_date)
-        if start_at is None:
-            return False
-        return datetime.now() < start_at
+        """当前时间早于活动开始时间。"""
+        return self.is_not_yet_open_at()
+
+    def is_truly_ended_at(self, now: datetime | None = None) -> bool:
+        return self.event_lifecycle_state_at(now) is TaskLifecycleState.ENDED
 
     @property
     def is_truly_ended(self) -> bool:
-        """已超过截止时间，或官网非进行中且无有效截止时间。"""
-        end_at = parse_mission_datetime(self.end_date)
-        if end_at is None:
-            return not self.is_event_active and not self.is_not_yet_open
-        if len((self.end_date or "").strip()) <= 10:
-            end_at += timedelta(days=1)
-        return datetime.now() >= end_at
+        """当前时间已达到活动截止时间。"""
+        return self.is_truly_ended_at()
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> Mission:
@@ -183,8 +322,8 @@ class Mission:
         return cls(
             drops_idx=str(data.get("dropsIdx", "")),
             title=str(data.get("title", "")),
-            start_date=str(data.get("startDate", "")),
-            end_date=str(data.get("endDate", "")),
+            start_date=_api_date_text(data.get("startDate")),
+            end_date=_api_date_text(data.get("endDate")),
             ingame_give=str(data.get("ingameGiveYn", "")).upper() == "Y",
             live=api_bool(data.get("live")),
             give_con=str(data.get("giveCon") or ""),
@@ -232,8 +371,8 @@ class DropEvent:
             dup_flag=api_bool(data.get("dupFlag")),
             live=api_bool(data.get("live")),
             acct_conn=api_bool(data.get("acctConn")),
-            start_date=str(data.get("startDate", "")),
-            end_date=str(data.get("endDate", "")),
+            start_date=_api_date_text(data.get("startDate")),
+            end_date=_api_date_text(data.get("endDate")),
             raw=data,
         )
 
@@ -270,32 +409,58 @@ class DropEvent:
         return "掉宝"
 
     @property
+    def completed(self) -> bool:
+        """Activity catalog rows do not carry account reward completion."""
+        return False
+
+    @property
+    def is_completed(self) -> bool:
+        return False
+
+    def event_lifecycle_state_at(self, now: datetime | None = None) -> TaskLifecycleState:
+        return event_lifecycle_state_at(
+            self.start_date,
+            self.end_date,
+            filter_value=self.filter,
+            live=self.live,
+            now=now,
+        )
+
+    def lifecycle_state_at(self, now: datetime | None = None) -> TaskLifecycleState:
+        return self.event_lifecycle_state_at(now)
+
+    @property
+    def lifecycle_state(self) -> TaskLifecycleState:
+        return self.lifecycle_state_at()
+
+    def is_event_active_at(self, now: datetime | None = None) -> bool:
+        return self.event_lifecycle_state_at(now) is TaskLifecycleState.ACTIVE
+
+    def is_event_ended_at(self, now: datetime | None = None) -> bool:
+        return self.event_lifecycle_state_at(now) is TaskLifecycleState.ENDED
+
+    def is_not_yet_open_at(self, now: datetime | None = None) -> bool:
+        return self.event_lifecycle_state_at(now) is TaskLifecycleState.UPCOMING
+
+    @property
     def is_event_active(self) -> bool:
-        """活动目录中当前进行中的 Drops。"""
-        if self.filter != "progress" or not self.live:
-            return False
-        end_at = parse_mission_datetime(self.end_date)
-        if end_at is None:
-            return True
-        if len((self.end_date or "").strip()) <= 10:
-            end_at += timedelta(days=1)
-        return datetime.now() < end_at
+        """活动目录中的当前进行中状态，由时间窗口决定。"""
+        return self.is_event_active_at()
+
+    @property
+    def is_event_ended(self) -> bool:
+        return self.is_event_ended_at()
 
     @property
     def is_not_yet_open(self) -> bool:
-        if self.is_event_active:
-            return False
-        start_at = parse_mission_datetime(self.start_date)
-        return start_at is not None and datetime.now() < start_at
+        return self.is_not_yet_open_at()
+
+    def is_truly_ended_at(self, now: datetime | None = None) -> bool:
+        return self.event_lifecycle_state_at(now) is TaskLifecycleState.ENDED
 
     @property
     def is_truly_ended(self) -> bool:
-        end_at = parse_mission_datetime(self.end_date)
-        if end_at is None:
-            return not self.is_event_active and not self.is_not_yet_open
-        if len((self.end_date or "").strip()) <= 10:
-            end_at += timedelta(days=1)
-        return datetime.now() >= end_at
+        return self.is_truly_ended_at()
 
     def matches_channel(self, channel: LiveChannel) -> bool:
         for row in self.raw.get("broadIdList") or []:
